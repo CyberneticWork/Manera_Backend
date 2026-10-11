@@ -1,0 +1,318 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           Int    @id @default(autoincrement())
+  username     String @unique @db.VarChar(80)
+  passwordHash String @map("password_hash") @db.VarChar(200)
+  title        String? @db.VarChar(120)
+  groupCode    String @map("group_code") @db.VarChar(40)
+  active       Int    @default(1)
+  company      String? @db.VarChar(120)
+  stationId    String? @map("station_id") @db.VarChar(120)
+  maxDisc      Float  @default(0) @map("max_disc")
+
+  @@map("users")
+}
+
+model Lookup {
+  id          Int     @id @default(autoincrement())
+  type        String  @db.VarChar(40)
+  description String  @db.VarChar(200)
+  category    String? @db.VarChar(80)
+
+  @@map("lookups")
+}
+
+model ClientHeader {
+  docNo            String @id @map("doc_no") @db.VarChar(40)
+  code             Int
+  nic              String? @db.VarChar(40)
+  name             String? @db.VarChar(200)
+  address          String? @db.VarChar(300)
+  mobileNo         String? @map("mobile_no") @db.VarChar(40)
+  location         String? @db.VarChar(120)
+  agentName        String? @map("agent_name") @db.VarChar(120)
+  agentCommission  Float   @default(0) @map("agent_commission")
+  riderName        String? @map("rider_name") @db.VarChar(120)
+  riderCommission  Float   @default(0) @map("rider_commission")
+  jobType          String? @map("job_type") @db.VarChar(20)
+  jobNoteNo        String? @map("job_note_no") @db.VarChar(40)
+  date             String? @db.VarChar(20)
+  note             String? @db.Text
+  reject           Int     @default(0)
+  buddy            String? @db.VarChar(80)
+  answered         String? @db.VarChar(20)
+  totalAmount      Float   @default(0) @map("total_amount")
+  status           Int     @default(0)
+  createdBy        String? @map("created_by") @db.VarChar(80)
+
+  @@map("client_header")
+}
+
+model ClientHeaderReject {
+  id              Int     @id @default(autoincrement())
+  docNo           String? @map("doc_no") @db.VarChar(40)
+  code            Int?
+  nic             String? @db.VarChar(40)
+  name            String? @db.VarChar(200)
+  address         String? @db.VarChar(300)
+  mobileNo        String? @map("mobile_no") @db.VarChar(40)
+  location        String? @db.VarChar(120)
+  agentName       String? @map("agent_name") @db.VarChar(120)
+  agentCommission Float?  @map("agent_commission")
+  riderName       String? @map("rider_name") @db.VarChar(120)
+  riderCommission Float?  @map("rider_commission")
+  jobType         String? @map("job_type") @db.VarChar(20)
+  jobNoteNo       String? @map("job_note_no") @db.VarChar(40)
+  date            String? @db.VarChar(20)
+  note            String? @db.Text
+  buddy           String? @db.VarChar(80)
+  answered        String? @db.VarChar(20)
+  totalAmount     Float?  @map("total_amount")
+  createdBy       String? @map("created_by") @db.VarChar(80)
+  rejectedAt      String? @map("rejected_at") @db.VarChar(40)
+
+  @@map("client_header_reject")
+}
+
+model ClientItem {
+  id          Int     @id @default(autoincrement())
+  docNo       String  @map("doc_no") @db.VarChar(40)
+  nic         String? @db.VarChar(40)
+  date        String? @db.VarChar(20)
+  category    String? @db.VarChar(80)
+  itemName    String? @map("item_name") @db.VarChar(120)
+  condition   String? @db.VarChar(80)
+  weight      Float   @default(0)
+  rate        String? @db.VarChar(40)
+  description String? @db.VarChar(300)
+
+  @@map("client_items")
+}
+
+model ClientImage {
+  id           Int     @id @default(autoincrement())
+  docNo        String  @map("doc_no") @db.VarChar(40)
+  nic          String? @db.VarChar(40)
+  date         String? @db.VarChar(20)
+  type         String? @db.VarChar(40)
+  url          String  @db.Text
+  imgNumber    Int?    @map("img_number")
+  storagePath  String? @map("storage_path") @db.VarChar(500)
+
+  @@map("client_images")
+}
+
+model ClientDocument {
+  id          Int     @id @default(autoincrement())
+  docNo       String  @map("doc_no") @db.VarChar(40)
+  nic         String? @db.VarChar(40)
+  date        String? @db.VarChar(20)
+  type        String? @db.VarChar(40)
+  fileName    String? @map("file_name") @db.VarChar(255)
+  url         String  @db.Text
+  storagePath String? @map("storage_path") @db.VarChar(500)
+  createdAt   String? @map("created_at") @db.VarChar(40)
+
+  @@map("client_documents")
+}
+
+model Finalized {
+  jobNo              String @id @map("job_no") @db.VarChar(40)
+  nic                String? @db.VarChar(40)
+  mobileNo           String? @map("mobile_no") @db.VarChar(40)
+  agentName          String? @map("agent_name") @db.VarChar(120)
+  riderName          String? @map("rider_name") @db.VarChar(120)
+  jobType            String? @map("job_type") @db.VarChar(20)
+  createDate         String? @map("create_date") @db.VarChar(20)
+  finalizedDate      String? @map("finalized_date") @db.VarChar(20)
+  createUser         String? @map("create_user") @db.VarChar(80)
+  cashier            String? @db.VarChar(80)
+  agentCommission    Float   @default(0) @map("agent_commission")
+  riderCommission    Float   @default(0) @map("rider_commission")
+  amount             Float   @default(0)
+  location           String? @db.VarChar(120)
+  itemCount          Int     @default(0) @map("item_count")
+  totalWeight        Float   @default(0) @map("total_weight")
+  firstAmount        Float   @default(0) @map("first_amount")
+  code               Int?
+  docNo              String? @map("doc_no") @db.VarChar(40)
+  approved           Int     @default(0)
+  permissionGranted  Int     @default(0) @map("permission_granted")
+
+  @@map("finalized")
+}
+
+model CallLog {
+  id        Int     @id @default(autoincrement())
+  date      String? @db.VarChar(20)
+  contactNo String? @map("contact_no") @db.VarChar(40)
+  reason    String? @db.VarChar(300)
+  agent     String? @db.VarChar(120)
+  agentNo   String? @map("agent_no") @db.VarChar(40)
+  status    Int?
+  callTime  String? @map("call_time") @db.VarChar(20)
+
+  @@map("call_log")
+}
+
+model MobileAssignment {
+  id       Int     @id @default(autoincrement())
+  date     String? @db.VarChar(20)
+  userName String? @map("user_name") @db.VarChar(80)
+  mobileNo String? @map("mobile_no") @db.VarChar(40)
+
+  @@map("mobile_assignments")
+}
+
+model DailyCode {
+  id        Int    @id @default(autoincrement())
+  code      String @db.VarChar(40)
+  date      String @unique @db.VarChar(20)
+  createdBy String? @map("created_by") @db.VarChar(80)
+
+  @@map("daily_codes")
+}
+
+model Setting {
+  key   String @id @db.VarChar(80)
+  value String @db.Text
+
+  @@map("settings")
+}
+
+model MainCash {
+  id          Int     @id @default(autoincrement())
+  date        String? @db.VarChar(20)
+  invoiceNo   String? @map("invoice_no") @db.VarChar(40)
+  description String? @db.VarChar(300)
+  debit       Float   @default(0)
+  credit      Float   @default(0)
+  remarks     String? @db.VarChar(300)
+  month       String? @db.VarChar(20)
+
+  @@map("main_cash")
+}
+
+model PettyCash {
+  id          Int     @id @default(autoincrement())
+  date        String? @db.VarChar(20)
+  invoiceNo   String? @map("invoice_no") @db.VarChar(40)
+  description String? @db.VarChar(300)
+  debit       Float   @default(0)
+  credit      Float   @default(0)
+  remarks     String? @db.VarChar(300)
+  month       String? @db.VarChar(20)
+
+  @@map("petty_cash")
+}
+
+model OpeningBalance {
+  date    String @id @db.VarChar(20)
+  opening Float  @default(0)
+  debit   Float  @default(0)
+  credit  Float  @default(0)
+  closing Float  @default(0)
+
+  @@map("opening_balances")
+}
+
+model AccountGroup {
+  code        String @id @db.VarChar(20)
+  description String @db.VarChar(120)
+
+  @@map("account_groups")
+}
+
+model AccountSubtype {
+  code        String  @id @db.VarChar(20)
+  description String  @db.VarChar(120)
+  groupCode   String? @map("group_code") @db.VarChar(20)
+  isBank      Int     @default(0) @map("is_bank")
+
+  @@map("account_subtypes")
+}
+
+model Account {
+  code          String  @id @db.VarChar(20)
+  name          String  @db.VarChar(160)
+  groupCode     String? @map("group_code") @db.VarChar(20)
+  subtypeCode   String? @map("subtype_code") @db.VarChar(20)
+  normalBalance String? @map("normal_balance") @db.VarChar(20)
+  opening       Float   @default(0)
+  payableAcc    String? @map("payable_acc") @db.VarChar(20)
+  settings      String? @db.VarChar(40)
+  bankName      String? @map("bank_name") @db.VarChar(120)
+  bankAccount   String? @map("bank_account") @db.VarChar(80)
+  company       String? @db.VarChar(120)
+
+  @@map("accounts")
+}
+
+model Journal {
+  id          Int     @id @default(autoincrement())
+  glNo        String? @map("gl_no") @db.VarChar(40)
+  description String? @db.VarChar(300)
+  remarks     String? @db.VarChar(300)
+  amount      Float   @default(0)
+  date        String? @db.VarChar(20)
+  userName    String? @map("user_name") @db.VarChar(80)
+  dc          String? @db.VarChar(4)
+  glType      String? @map("gl_type") @db.VarChar(20)
+  accNo       String? @map("acc_no") @db.VarChar(20)
+  docNo       String? @map("doc_no") @db.VarChar(40)
+  accountName String? @map("account_name") @db.VarChar(160)
+
+  @@map("journal")
+}
+
+model DebitNote {
+  id        Int     @id @default(autoincrement())
+  docCode   Int?    @map("doc_code")
+  noteNo    String? @map("note_no") @db.VarChar(40)
+  date      String? @db.VarChar(20)
+  debitAcc  String? @map("debit_acc") @db.VarChar(20)
+  creditAcc String? @map("credit_acc") @db.VarChar(20)
+  amount    Float?
+  vat       Float?
+  setoffInv String? @map("setoff_inv") @db.VarChar(40)
+  taxType   String? @map("tax_type") @db.VarChar(20)
+  userName  String? @map("user_name") @db.VarChar(80)
+  remarks   String? @db.VarChar(300)
+
+  @@map("debit_notes")
+}
+
+model CreditNote {
+  id        Int     @id @default(autoincrement())
+  docCode   Int?    @map("doc_code")
+  noteNo    String? @map("note_no") @db.VarChar(40)
+  date      String? @db.VarChar(20)
+  debitAcc  String? @map("debit_acc") @db.VarChar(20)
+  creditAcc String? @map("credit_acc") @db.VarChar(20)
+  amount    Float?
+  setoffInv String? @map("setoff_inv") @db.VarChar(40)
+  userName  String? @map("user_name") @db.VarChar(80)
+  remarks   String? @db.VarChar(300)
+
+  @@map("credit_notes")
+}
+
+model AuditLog {
+  id       Int     @id @default(autoincrement())
+  menuCode String? @map("menu_code") @db.VarChar(40)
+  refCode  String? @map("ref_code") @db.VarChar(80)
+  userName String? @map("user_name") @db.VarChar(80)
+  action   String? @db.VarChar(200)
+  logDate  String? @map("log_date") @db.VarChar(20)
+  logTime  String? @map("log_time") @db.VarChar(20)
+
+  @@map("audit_log")
+}

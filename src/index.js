@@ -1,0 +1,1007 @@
+require('dotenv').config();
+const path = require('path');
+const fs = require('fs');
+const express = require('express');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const multer = require('multer');
+const storage = require('./storage');
+const { db, today, ensureOpening } = require('./db');
+const biz = require('./business');
+const { build: buildPdf, collect: collectReport } = require('./pdfs');
+
+const app = express();
+const PORT = Number(process.env.PORT || 4000);
+const HOST = process.env.HOST || '0.0.0.0';
+const JWT_SECRET = process.env.JWT_SECRET || 'goldstore-dev-secret';
+
+app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
+app.use(express.json({ limit: '4mb' }));
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+});
+
+function sign(user) {
+  return jwt.sign(
+    { id: user.id, username: user.username, group: user.group_code, title: user.title },
+    JWT_SECRET,
+    { expiresIn: '12h' }
+  );
+}
+
+function auth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!token) return res.status(401).json({ error: 'Login required' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Session expired. Please login again.' });
+  }
+}
+
+function allow(...roles) {
+  return (req, res, next) => {
+    if (req.user.group === 'SAdmin' || roles.includes(req.user.group)) return next();
+    res.status(403).json({ error: 'Your role cannot open this screen' });
+  };
+}
+
+function asyncRoute(fn) {
+  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+}
+
+function bad(message) {
+  const err = new Error(message);
+  err.status = 400;
+  throw err;
+}
+
+function num(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, name: 'Gold Store', time: new Date().toISOString() });
+});
+
+app.post('/api/auth/login', asyncRoute((req, res) => {
+  const username = String(req.body.username || '').trim();
+  const password = String(req.body.password || '');
+  if (!username || !password) return res.status(400).json({ error: 'Enter username and password' });
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  if (!user || !user.active || !bcrypt.compareSync(password, user.password_hash)) {
+    return res.status(401).json({ error: 'User name or password is wrong' });
+  }
+  const opening = ensureOpening(today());
+  biz.audit(user.username, 'LOGIN', user.username, 'Login');
+  res.json({
+    token: sign(user),
+    user: {
+      id: user.id,
+      username: user.username,
+      title: user.title,
+      group: user.group_code,
+      company: user.company,
+    },
+    opening,
+    company: {
+      name: biz.setting('company_name', 'Gold Store'),
+      address: biz.setting('company_address', ''),
+      phone: biz.setting('company_phone', ''),
+    },
+  });
+}));
+
+app.get('/api/auth/me', auth, (req, res) => {
+  const user = db.prepare('SELECT id, username, title, group_code, company FROM users WHERE id = ?').get(req.user.id);
+  if (!user) return res.status(401).json({ error: 'User not found' });
+  res.json({
+    user: { id: user.id, username: user.username, title: user.title, group: user.group_code, company: user.company },
+    company: {
+      name: biz.setting('company_name', 'Gold Store'),
+      address: biz.setting('company_address', ''),
+      phone: biz.setting('company_phone', ''),
+    },
+  });
+});
+
+app.get('/api/dashboard', auth, (req, res) => {
+  const date = today();
+  const month = date.slice(0, 7);
+  const pending = db.prepare('SELECT COUNT(*) AS c FROM client_header WHERE status = 0 AND reject = 0').get().c;
+  const finalizedToday = db.prepare('SELECT COUNT(*) AS c FROM finalized WHERE finalized_date = ?').get(date).c;
+  const unapproved = db.prepare('SELECT COUNT(*) AS c FROM finalized WHERE approved = 0').get().c;
+  const cash = db.prepare(
+    'SELECT COALESCE(SUM(debit), 0) AS debit, COALESCE(SUM(credit), 0) AS credit FROM main_cash WHERE date = ?'
+  ).get(date);
+  const todayJobs = db.prepare(
+    `SELECT COUNT(*) AS jobs, COALESCE(SUM(amount), 0) AS amount, COALESCE(SUM(total_weight), 0) AS weight
+     FROM finalized WHERE finalized_date = ?`
+  ).get(date);
+  const monthJobs = db.prepare(
+    `SELECT COUNT(*) AS jobs, COALESCE(SUM(amount), 0) AS amount
+     FROM finalized WHERE finalized_date LIKE ?`
+  ).get(`${month}%`);
+  const byType = db.prepare(
+    `SELECT job_type, COUNT(*) AS jobs, COALESCE(SUM(amount), 0) AS amount
+     FROM finalized WHERE finalized_date = ? GROUP BY job_type`
+  ).all(date);
+  const callsToday = db.prepare('SELECT COUNT(*) AS c FROM call_log WHERE date = ?').get(date).c;
+  res.json({
+    date,
+    pending,
+    finalizedToday,
+    unapproved,
+    cashDebit: cash.debit,
+    cashCredit: cash.credit,
+    weightToday: todayJobs.weight,
+    amountToday: todayJobs.amount,
+    monthJobs: monthJobs.jobs,
+    monthAmount: monthJobs.amount,
+    callsToday,
+    byType,
+    recent: db.prepare(
+      `SELECT job_no, doc_no, nic, job_type, amount, location, finalized_date, approved
+       FROM finalized ORDER BY finalized_date DESC, job_no DESC LIMIT 6`
+    ).all(),
+    waiting: db.prepare(
+      `SELECT doc_no, name, nic, job_type, location, date, total_amount
+       FROM client_header WHERE status = 0 AND reject = 0
+       ORDER BY date DESC, doc_no DESC LIMIT 6`
+    ).all(),
+    role: req.user.group,
+  });
+});
+
+app.get('/api/lookups', auth, (_req, res) => {
+  const rows = db.prepare('SELECT id, type, description, category FROM lookups ORDER BY type, description').all();
+  const grouped = {};
+  for (const row of rows) {
+    if (!grouped[row.type]) grouped[row.type] = [];
+    grouped[row.type].push(row);
+  }
+  res.json(grouped);
+});
+
+app.post('/api/lookups', auth, allow('SAdmin', 'CallCenter', 'Cashier', 'Account'), asyncRoute((req, res) => {
+  const type = String(req.body.type || '').trim();
+  const description = String(req.body.description || '').trim();
+  const category = req.body.category ? String(req.body.category).trim() : null;
+  if (!type || !description) bad('Type and description are required');
+  const info = db.prepare('INSERT INTO lookups (type, description, category) VALUES (?, ?, ?)').run(type, description, category);
+  res.json({ id: info.lastInsertRowid, type, description, category });
+}));
+
+app.put('/api/lookups/:id', auth, allow('SAdmin', 'CallCenter', 'Cashier', 'Account'), (req, res) => {
+  const description = String(req.body.description || '').trim();
+  if (!description) return res.status(400).json({ error: 'Description is required' });
+  db.prepare('UPDATE lookups SET description = ?, category = ? WHERE id = ?').run(
+    description,
+    req.body.category ? String(req.body.category) : null,
+    req.params.id
+  );
+  res.json({ ok: true });
+});
+
+app.delete('/api/lookups/:id', auth, allow('SAdmin'), (req, res) => {
+  db.prepare('DELETE FROM lookups WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+function jobPayload(row, items, images, documents) {
+  return { ...row, items, images, documents: documents || [] };
+}
+
+app.get('/api/clients', auth, allow('CallCenter', 'SAdmin', 'Cashier', 'Account', 'History'), (req, res) => {
+  const status = req.query.status === undefined ? 0 : Number(req.query.status);
+  const rows = db.prepare(
+    `SELECT doc_no, agent_name, mobile_no, date, name, nic, location, total_amount, job_type, status, reject
+     FROM client_header WHERE status = ? AND reject = 0 ORDER BY code DESC`
+  ).all(status);
+  res.json(rows);
+});
+
+app.get('/api/clients/:docNo', auth, (req, res) => {
+  const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
+  if (!header) return res.status(404).json({ error: 'Job not found' });
+  const items = db.prepare('SELECT * FROM client_items WHERE doc_no = ? ORDER BY id').all(req.params.docNo);
+  const images = db.prepare('SELECT * FROM client_images WHERE doc_no = ? ORDER BY id').all(req.params.docNo);
+  const documents = db.prepare('SELECT * FROM client_documents WHERE doc_no = ? ORDER BY id').all(req.params.docNo);
+  res.json(jobPayload(header, items, images, documents));
+});
+
+app.get('/api/clients/next/code', auth, allow('CallCenter', 'SAdmin'), (_req, res) => {
+  res.json(biz.nextDocNo());
+});
+
+function saveItems(docNo, nic, date, items) {
+  db.prepare('DELETE FROM client_items WHERE doc_no = ?').run(docNo);
+  const insert = db.prepare(
+    `INSERT INTO client_items (doc_no, nic, date, category, item_name, condition, weight, rate, description)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  for (const item of items || []) {
+    insert.run(
+      docNo,
+      nic,
+      date,
+      item.category || '',
+      item.itemName || item.item_name || '',
+      item.condition || '',
+      num(item.weight),
+      item.rate || '',
+      item.description || ''
+    );
+  }
+}
+
+app.post('/api/clients', auth, allow('CallCenter', 'SAdmin'), asyncRoute((req, res) => {
+  const body = req.body || {};
+  if (!body.name || !body.mobileNo) bad('Customer name and mobile number are required');
+  const { docNo, code } = biz.nextDocNo();
+  const date = body.date || today();
+  const save = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO client_header
+        (doc_no, code, nic, name, address, mobile_no, location, agent_name, agent_commission,
+         rider_name, rider_commission, job_type, job_note_no, date, note, reject, buddy, answered,
+         total_amount, status, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 0, ?)`
+    ).run(
+      docNo, code, body.nic || '', body.name, body.address || '', body.mobileNo, body.location || '',
+      body.agentName || '', num(body.agentCommission), body.riderName || '', num(body.riderCommission),
+      body.jobType || '', body.jobNoteNo || '', date, body.note || '', body.buddy || '', body.answered || '',
+      num(body.totalAmount), req.user.username
+    );
+    saveItems(docNo, body.nic || '', date, body.items || []);
+    if (body.totalAmount === undefined || body.totalAmount === '') {
+      db.prepare('UPDATE client_header SET total_amount = 0 WHERE doc_no = ? AND total_amount IS NULL').run(docNo);
+    }
+  });
+  save();
+  biz.audit(req.user.username, 'CLIENT', docNo, 'Create job');
+  res.json({ docNo, code });
+}));
+
+app.put('/api/clients/:docNo', auth, allow('CallCenter', 'SAdmin', 'Cashier', 'Account'), asyncRoute((req, res) => {
+  const existing = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
+  if (!existing) return res.status(404).json({ error: 'Job not found' });
+  if (existing.status === 1 && req.user.group !== 'SAdmin') {
+    return res.status(400).json({ error: 'This job is already finalized' });
+  }
+  const body = req.body || {};
+  const date = body.date || existing.date;
+  const save = db.transaction(() => {
+    db.prepare(
+      `UPDATE client_header SET nic = ?, name = ?, address = ?, mobile_no = ?, location = ?,
+        agent_name = ?, agent_commission = ?, rider_name = ?, rider_commission = ?, job_type = ?,
+        job_note_no = ?, date = ?, note = ?, buddy = ?, answered = ?, total_amount = ?
+       WHERE doc_no = ?`
+    ).run(
+      body.nic ?? existing.nic,
+      body.name ?? existing.name,
+      body.address ?? existing.address,
+      body.mobileNo ?? existing.mobile_no,
+      body.location ?? existing.location,
+      body.agentName ?? existing.agent_name,
+      body.agentCommission !== undefined ? num(body.agentCommission) : existing.agent_commission,
+      body.riderName ?? existing.rider_name,
+      body.riderCommission !== undefined ? num(body.riderCommission) : existing.rider_commission,
+      body.jobType ?? existing.job_type,
+      body.jobNoteNo ?? existing.job_note_no,
+      date,
+      body.note ?? existing.note,
+      body.buddy ?? existing.buddy,
+      body.answered ?? existing.answered,
+      body.totalAmount !== undefined ? num(body.totalAmount) : existing.total_amount,
+      req.params.docNo
+    );
+    if (Array.isArray(body.items)) saveItems(req.params.docNo, body.nic ?? existing.nic, date, body.items);
+  });
+  save();
+  biz.audit(req.user.username, 'CLIENT', req.params.docNo, 'Update job');
+  res.json({ ok: true });
+}));
+
+app.post('/api/clients/:docNo/reject', auth, allow('CallCenter', 'SAdmin'), (req, res) => {
+  const row = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
+  if (!row) return res.status(404).json({ error: 'Job not found' });
+  const reject = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO client_header_reject
+        (doc_no, code, nic, name, address, mobile_no, location, agent_name, agent_commission,
+         rider_name, rider_commission, job_type, job_note_no, date, note, buddy, answered,
+         total_amount, created_by, rejected_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      row.doc_no, row.code, row.nic, row.name, row.address, row.mobile_no, row.location, row.agent_name,
+      row.agent_commission, row.rider_name, row.rider_commission, row.job_type, row.job_note_no, row.date,
+      row.note, row.buddy, row.answered, row.total_amount, row.created_by, new Date().toISOString()
+    );
+    db.prepare('UPDATE client_header SET reject = 1 WHERE doc_no = ?').run(row.doc_no);
+  });
+  reject();
+  biz.audit(req.user.username, 'CLIENT', row.doc_no, 'Reject job');
+  res.json({ ok: true });
+});
+
+app.post('/api/clients/:docNo/images', auth, allow('CallCenter', 'SAdmin', 'Cashier'), upload.single('image'), asyncRoute(async (req, res) => {
+  const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
+  if (!header) return res.status(404).json({ error: 'Job not found' });
+  if (!req.file) return res.status(400).json({ error: 'Choose an image' });
+  if (!/^image\//.test(req.file.mimetype)) return res.status(400).json({ error: 'Choose an image file' });
+  const count = db.prepare('SELECT COUNT(*) AS c FROM client_images WHERE doc_no = ?').get(req.params.docNo).c;
+  const stored = await storage.uploadObject({
+    buffer: req.file.buffer,
+    contentType: req.file.mimetype,
+    originalName: req.file.originalname,
+    folder: `clients/${req.params.docNo}/images`,
+  });
+  const info = db.prepare(
+    'INSERT INTO client_images (doc_no, nic, date, type, url, img_number, storage_path) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(req.params.docNo, header.nic, header.date, req.body.type || 'Item', stored.url, count + 1, stored.storagePath);
+  res.json({ id: info.lastInsertRowid, url: stored.url, type: req.body.type || 'Item' });
+}));
+
+app.delete('/api/clients/:docNo/images/:id', auth, allow('CallCenter', 'SAdmin'), asyncRoute(async (req, res) => {
+  const image = db.prepare('SELECT * FROM client_images WHERE id = ? AND doc_no = ?').get(req.params.id, req.params.docNo);
+  if (!image) return res.status(404).json({ error: 'Image not found' });
+  await storage.deleteObject(image.storage_path);
+  db.prepare('DELETE FROM client_images WHERE id = ?').run(image.id);
+  res.json({ ok: true });
+}));
+
+app.post('/api/clients/:docNo/documents', auth, allow('CallCenter', 'SAdmin', 'Cashier'), upload.single('document'), asyncRoute(async (req, res) => {
+  const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
+  if (!header) return res.status(404).json({ error: 'Job not found' });
+  if (!req.file) return res.status(400).json({ error: 'Choose a document' });
+  const stored = await storage.uploadObject({
+    buffer: req.file.buffer,
+    contentType: req.file.mimetype,
+    originalName: req.file.originalname,
+    folder: `clients/${req.params.docNo}/documents`,
+  });
+  const info = db.prepare(
+    `INSERT INTO client_documents (doc_no, nic, date, type, file_name, url, storage_path, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    req.params.docNo, header.nic, header.date, req.body.type || 'Document',
+    req.file.originalname || 'document', stored.url, stored.storagePath, new Date().toISOString()
+  );
+  res.json({ id: info.lastInsertRowid, url: stored.url, fileName: req.file.originalname });
+}));
+
+app.delete('/api/clients/:docNo/documents/:id', auth, allow('CallCenter', 'SAdmin'), asyncRoute(async (req, res) => {
+  const document = db.prepare('SELECT * FROM client_documents WHERE id = ? AND doc_no = ?').get(req.params.id, req.params.docNo);
+  if (!document) return res.status(404).json({ error: 'Document not found' });
+  await storage.deleteObject(document.storage_path);
+  db.prepare('DELETE FROM client_documents WHERE id = ?').run(document.id);
+  res.json({ ok: true });
+}));
+
+app.get('/api/history', auth, (req, res) => {
+  const mode = req.query.mode || 'all';
+  const q = String(req.query.q || '').trim();
+  let sql = `SELECT doc_no, nic, name, mobile_no, location, agent_name, rider_name, job_type, date, total_amount, status
+             FROM client_header WHERE status = 1 AND reject = 0`;
+  const params = [];
+  if (mode === 'nic') {
+    sql += ' AND nic LIKE ?';
+    params.push(`%${q}%`);
+  } else if (mode === 'mobile') {
+    sql += ' AND mobile_no LIKE ?';
+    params.push(`%${q}%`);
+  } else if (mode === 'location') {
+    sql += ' AND location LIKE ?';
+    params.push(`%${q}%`);
+  } else if (mode === 'rider') {
+    sql += ' AND rider_name LIKE ?';
+    params.push(`%${q}%`);
+  } else if (mode === 'agent') {
+    sql += ' AND agent_name LIKE ?';
+    params.push(`%${q}%`);
+  } else if (mode === 'date') {
+    sql += ' AND date >= ? AND date <= ?';
+    params.push(req.query.from || today(), req.query.to || today());
+  } else if (req.user.group === 'History') {
+    return res.json([]);
+  }
+  sql += ' ORDER BY date DESC, code DESC LIMIT 500';
+  res.json(db.prepare(sql).all(...params));
+});
+
+function loadOpenJob(where, value) {
+  return db.prepare(
+    `SELECT * FROM client_header WHERE ${where} = ? AND status = 0 AND reject = 0 ORDER BY code DESC LIMIT 1`
+  ).get(value);
+}
+
+app.get('/api/cashier/lookup', auth, allow('Cashier', 'Account'), (req, res) => {
+  const date = req.query.date || today();
+  if (!biz.withinSevenDays(date)) {
+    return res.status(400).json({ error: 'Please select a date within the last 7 days', jobNo: null });
+  }
+  let header = null;
+  if (req.query.nic) header = loadOpenJob('nic', String(req.query.nic).trim());
+  else if (req.query.mobile) header = loadOpenJob('mobile_no', String(req.query.mobile).trim());
+  else if (req.query.docNo) header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(String(req.query.docNo).trim());
+  else return res.status(400).json({ error: 'Enter NIC, mobile number, or job number' });
+  if (!header) return res.status(404).json({ error: 'No open job found' });
+  const items = db.prepare('SELECT * FROM client_items WHERE doc_no = ?').all(header.doc_no);
+  const images = db.prepare('SELECT * FROM client_images WHERE doc_no = ?').all(header.doc_no);
+  const totals = biz.itemTotals(header.doc_no);
+  const commission = biz.agentCommission(totals.totalWeight, header.job_type, header.agent_commission);
+  const finalized = db.prepare('SELECT job_no FROM finalized WHERE doc_no = ?').get(header.doc_no);
+  res.json({
+    job: header,
+    items,
+    images,
+    totals,
+    agentCommission: commission,
+    suggestedJobNo: biz.nextJobNo(date),
+    alreadyFinalized: Boolean(finalized),
+  });
+});
+
+app.get('/api/cashier/job-no', auth, allow('Cashier', 'Account'), (req, res) => {
+  const date = req.query.date || today();
+  if (!biz.withinSevenDays(date)) return res.status(400).json({ error: 'Please select a date within the last 7 days' });
+  res.json(biz.nextJobNo(date));
+});
+
+app.post('/api/cashier/finalize', auth, allow('Cashier', 'Account'), asyncRoute((req, res) => {
+  const docNo = String(req.body.docNo || '').trim();
+  const date = req.body.date || today();
+  const amount = num(req.body.amount);
+  if (!docNo) bad('Job number is required');
+  if (!biz.withinSevenDays(date)) bad('Please select a date within the last 7 days');
+  if (amount <= 0) bad('Enter the final payout amount');
+  const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ? AND reject = 0').get(docNo);
+  if (!header) return res.status(404).json({ error: 'Job not found' });
+  if (header.status === 1) return res.status(400).json({ error: 'This job is already finalized' });
+  const totals = biz.itemTotals(docNo);
+  const { jobNo, code } = biz.nextJobNo(date);
+  const agentCommission = req.body.agentCommission !== undefined
+    ? num(req.body.agentCommission)
+    : biz.agentCommission(totals.totalWeight, header.job_type, header.agent_commission);
+  const riderCommission = req.body.riderCommission !== undefined ? num(req.body.riderCommission) : num(header.rider_commission);
+  const save = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO finalized
+        (job_no, nic, mobile_no, agent_name, rider_name, job_type, create_date, finalized_date,
+         create_user, cashier, agent_commission, rider_commission, amount, location, item_count,
+         total_weight, first_amount, code, doc_no, approved, permission_granted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)`
+    ).run(
+      jobNo, header.nic, header.mobile_no, header.agent_name, header.rider_name, header.job_type,
+      header.date, date, header.agent_name, req.user.username, agentCommission, riderCommission,
+      amount, header.location, totals.itemCount, totals.totalWeight, num(header.total_amount),
+      code, docNo
+    );
+    db.prepare('UPDATE client_header SET status = 1 WHERE doc_no = ?').run(docNo);
+    db.prepare('UPDATE call_log SET status = 0 WHERE status IS NULL').run();
+    biz.postCash(
+      'main_cash',
+      today(),
+      jobNo,
+      `${totals.itemCount}/${totals.totalWeight}${header.location || ''}`,
+      amount,
+      0,
+      ''
+    );
+  });
+  save();
+  biz.audit(req.user.username, 'CASHIER', jobNo, 'Finalize');
+  res.json({ jobNo, code, agentCommission, riderCommission, totals });
+}));
+
+app.post('/api/cashier/cancel', auth, allow('Cashier', 'Account', 'SAdmin'), (req, res) => {
+  const jobNo = String(req.body.jobNo || '').trim();
+  const row = db.prepare('SELECT * FROM finalized WHERE job_no = ?').get(jobNo);
+  if (!row) return res.status(404).json({ error: 'Finalized job not found' });
+  const cancel = db.transaction(() => {
+    db.prepare('DELETE FROM finalized WHERE job_no = ?').run(jobNo);
+    db.prepare('UPDATE client_header SET status = 0 WHERE doc_no = ?').run(row.doc_no);
+    db.prepare('DELETE FROM main_cash WHERE invoice_no = ?').run(jobNo);
+  });
+  cancel();
+  biz.audit(req.user.username, 'CASHIER', jobNo, 'Cancel finalize');
+  res.json({ ok: true, docNo: row.doc_no });
+});
+
+app.get('/api/calls', auth, allow('CallCenter'), (req, res) => {
+  const contact = String(req.query.contact || '').trim();
+  if (!contact) return res.json([]);
+  const rows = db.prepare(
+    'SELECT * FROM call_log WHERE contact_no = ? ORDER BY id DESC LIMIT 100'
+  ).all(contact);
+  res.json(rows);
+});
+
+app.post('/api/calls', auth, allow('CallCenter'), (req, res) => {
+  const contact = String(req.body.contactNo || '').trim();
+  const reason = String(req.body.reason || '').trim();
+  if (!contact || !reason) return res.status(400).json({ error: 'Contact number and comments are required' });
+  const now = new Date();
+  const info = db.prepare(
+    `INSERT INTO call_log (date, contact_no, reason, agent, agent_no, status, call_time)
+     VALUES (?, ?, ?, ?, ?, 0, ?)`
+  ).run(today(), contact, reason, req.body.agent || req.user.username, req.body.agentNo || '', now.toLocaleTimeString());
+  res.json({ id: info.lastInsertRowid });
+});
+
+app.get('/api/assignments', auth, allow('CallCenter'), (_req, res) => {
+  res.json(db.prepare('SELECT * FROM mobile_assignments ORDER BY user_name, mobile_no').all());
+});
+
+app.post('/api/assignments', auth, allow('CallCenter'), (req, res) => {
+  const userName = String(req.body.userName || '').trim();
+  const mobileNo = String(req.body.mobileNo || '').trim();
+  if (!userName || !mobileNo) return res.status(400).json({ error: 'User and mobile number are required' });
+  const info = db.prepare(
+    'INSERT INTO mobile_assignments (date, user_name, mobile_no) VALUES (?, ?, ?)'
+  ).run(today(), userName, mobileNo);
+  res.json({ id: info.lastInsertRowid });
+});
+
+app.post('/api/assignments/replace', auth, allow('CallCenter', 'SAdmin'), (req, res) => {
+  const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
+  const save = db.transaction(() => {
+    db.prepare('DELETE FROM mobile_assignments').run();
+    const insert = db.prepare('INSERT INTO mobile_assignments (date, user_name, mobile_no) VALUES (?, ?, ?)');
+    for (const row of rows) {
+      if (row.userName && row.mobileNo) insert.run(today(), row.userName, row.mobileNo);
+    }
+  });
+  save();
+  res.json({ ok: true });
+});
+
+app.post('/api/assignments/transfer', auth, allow('CallCenter', 'SAdmin'), (req, res) => {
+  const fromUser = String(req.body.fromUser || '').trim();
+  const toUser = String(req.body.toUser || '').trim();
+  if (!fromUser || !toUser) return res.status(400).json({ error: 'Choose both agents' });
+  db.prepare('UPDATE mobile_assignments SET user_name = ? WHERE user_name = ?').run(toUser, fromUser);
+  res.json({ ok: true });
+});
+
+app.get('/api/assignments/mine', auth, (req, res) => {
+  res.json(db.prepare('SELECT * FROM mobile_assignments WHERE user_name = ?').all(req.user.username));
+});
+
+function approvalGuard(req, res) {
+  if (req.user.group !== 'SAdmin' && biz.hasOverdueUnapproved()) {
+    res.status(403).json({
+      error: 'Jobs older than 7 days are still waiting for approval. A super admin must grant permission first.',
+    });
+    return false;
+  }
+  return true;
+}
+
+app.get('/api/approvals', auth, allow('Admin'), (req, res) => {
+  if (!approvalGuard(req, res)) return;
+  const date = req.query.date || today();
+  const rows = db.prepare(
+    `SELECT finalized_date, job_no, nic, mobile_no, agent_name, rider_name, job_type, amount, location,
+            approved, permission_granted, doc_no, item_count, total_weight, agent_commission, rider_commission
+     FROM finalized WHERE finalized_date = ? ORDER BY job_no`
+  ).all(date);
+  res.json(rows);
+});
+
+app.get('/api/approvals/:jobNo', auth, allow('Admin'), (req, res) => {
+  if (!approvalGuard(req, res)) return;
+  const row = db.prepare('SELECT * FROM finalized WHERE job_no = ?').get(req.params.jobNo);
+  if (!row) return res.status(404).json({ error: 'Job not found' });
+  const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(row.doc_no);
+  const items = db.prepare('SELECT * FROM client_items WHERE doc_no = ?').all(row.doc_no);
+  const images = db.prepare('SELECT * FROM client_images WHERE doc_no = ?').all(row.doc_no);
+  res.json({ finalized: row, header, items, images });
+});
+
+app.post('/api/approvals/:jobNo/approve', auth, allow('Admin'), (req, res) => {
+  if (!approvalGuard(req, res)) return;
+  const info = db.prepare(
+    'UPDATE finalized SET approved = 1, permission_granted = 1 WHERE job_no = ?'
+  ).run(req.params.jobNo);
+  if (!info.changes) return res.status(404).json({ error: 'Job not found' });
+  biz.audit(req.user.username, 'APPROVAL', req.params.jobNo, 'Approve');
+  res.json({ ok: true });
+});
+
+app.post('/api/approvals/grant-permission', auth, (req, res) => {
+  if (req.user.group !== 'SAdmin') return res.status(403).json({ error: 'Only super admin can grant permission' });
+  db.prepare('UPDATE finalized SET permission_granted = 1 WHERE permission_granted = 0').run();
+  biz.audit(req.user.username, 'APPROVAL', '*', 'Grant permission');
+  res.json({ ok: true });
+});
+
+app.get('/api/approvals/dashboard/day', auth, allow('Admin'), (req, res) => {
+  if (!approvalGuard(req, res)) return;
+  const date = req.query.date || today();
+  const jobs = db.prepare('SELECT * FROM finalized WHERE finalized_date = ?').all(date);
+  const rate = num(biz.setting('business_commission', '0'));
+  const riderRate = num(biz.setting('rider_commission', '0'));
+  const xr = jobs.filter((j) => j.job_type === 'XR').reduce((sum, j) => sum + num(j.agent_commission), 0);
+  const nr = jobs.filter((j) => j.job_type === 'NR').reduce((sum, j) => sum + num(j.agent_commission), 0);
+  const business = biz.round2(rate * jobs.length);
+  const rider = biz.round2(jobs.length * riderRate);
+  const agent = biz.round2(xr + nr);
+  res.json({
+    date,
+    count: jobs.length,
+    businessCommission: business,
+    xr: biz.round2(xr),
+    nr: biz.round2(nr),
+    agentCommission: agent,
+    riderCommission: rider,
+    balance: biz.round2(business - (nr + xr + rider)),
+    rate,
+    riderRate,
+  });
+});
+
+app.get('/api/commission', auth, allow('Admin'), (_req, res) => {
+  res.json({
+    businessCommission: num(biz.setting('business_commission', '0')),
+    riderCommission: num(biz.setting('rider_commission', '0')),
+  });
+});
+
+app.put('/api/commission', auth, allow('Admin'), (req, res) => {
+  if (req.body.businessCommission !== undefined) biz.setSetting('business_commission', num(req.body.businessCommission));
+  if (req.body.riderCommission !== undefined) biz.setSetting('rider_commission', num(req.body.riderCommission));
+  res.json({
+    businessCommission: num(biz.setting('business_commission', '0')),
+    riderCommission: num(biz.setting('rider_commission', '0')),
+  });
+});
+
+app.get('/api/access-codes', auth, allow('Admin'), (_req, res) => {
+  res.json(db.prepare('SELECT id, code, date, created_by FROM daily_codes ORDER BY date DESC LIMIT 60').all());
+});
+
+app.post('/api/access-codes', auth, allow('Admin'), (req, res) => {
+  const date = req.body.date || today();
+  let code = String(req.body.code || '').replace(/\s/g, '');
+  if (code.length >= 3 && !code.includes('#')) code = `${code.slice(0, 3)}#${code.slice(3)}`;
+  if (code.length < 4) return res.status(400).json({ error: 'Enter an access code of at least 3 characters' });
+  const existing = db.prepare('SELECT id FROM daily_codes WHERE date = ?').get(date);
+  if (existing) return res.status(400).json({ error: 'An access code already exists for this date' });
+  db.prepare('INSERT INTO daily_codes (code, date, created_by) VALUES (?, ?, ?)').run(code, date, req.user.username);
+  res.json({ code, date });
+});
+
+function normalizeCode(value) {
+  return String(value || '').replace(/#/g, '').replace(/\s/g, '').toUpperCase();
+}
+
+function requireAccess(req, res) {
+  const date = String(req.query.from || req.query.date || today()).slice(0, 10);
+  const code = normalizeCode(req.query.code);
+  const row = db.prepare('SELECT * FROM daily_codes WHERE date = ?').get(date);
+  if (!row) {
+    res.status(403).json({ error: `No access code is saved for ${date}. Create one on the Access Code screen first.` });
+    return null;
+  }
+  if (!code || normalizeCode(row.code) !== code) {
+    res.status(403).json({ error: `That code does not match the access code saved for ${date}.` });
+    return null;
+  }
+  return date;
+}
+
+app.get('/api/reports/bought', auth, (req, res) => {
+  if (!requireAccess(req, res)) return;
+  const from = req.query.from || today();
+  const to = req.query.to || from;
+  const rows = db.prepare(
+    `SELECT * FROM finalized WHERE finalized_date >= ? AND finalized_date <= ? ORDER BY finalized_date, job_no`
+  ).all(from, to);
+  res.json(rows);
+});
+
+app.get('/api/reports/summary', auth, (req, res) => {
+  if (!requireAccess(req, res)) return;
+  const from = req.query.from || today();
+  const to = req.query.to || from;
+  const rows = db.prepare(
+    `SELECT job_type, COUNT(*) AS jobs, COALESCE(SUM(amount), 0) AS amount,
+            COALESCE(SUM(total_weight), 0) AS weight, COALESCE(SUM(agent_commission), 0) AS agent_commission
+     FROM finalized WHERE finalized_date >= ? AND finalized_date <= ?
+     GROUP BY job_type`
+  ).all(from, to);
+  res.json(rows);
+});
+
+app.get('/api/reports/main-cash', auth, (req, res) => {
+  if (!requireAccess(req, res)) return;
+  const date = req.query.from || today();
+  const opening = ensureOpening(date);
+  const rows = db.prepare('SELECT * FROM main_cash WHERE date = ? ORDER BY id').all(date);
+  res.json({ opening, rows });
+});
+
+app.get('/api/reports/petty-cash', auth, (req, res) => {
+  if (!requireAccess(req, res)) return;
+  const date = req.query.from || today();
+  res.json(db.prepare('SELECT * FROM petty_cash WHERE date = ? ORDER BY id').all(date));
+});
+
+app.get('/api/reports/journal', auth, (req, res) => {
+  if (!requireAccess(req, res)) return;
+  const from = req.query.from || today();
+  const to = req.query.to || from;
+  res.json(db.prepare('SELECT * FROM journal WHERE date >= ? AND date <= ? ORDER BY id').all(from, to));
+});
+
+app.get('/api/reports/chart', auth, (req, res) => {
+  if (!requireAccess(req, res)) return;
+  res.json(db.prepare(
+    `SELECT a.code, a.name, g.description AS group_name, s.description AS subtype_name, a.normal_balance, a.opening, a.settings
+     FROM accounts a
+     LEFT JOIN account_groups g ON g.code = a.group_code
+     LEFT JOIN account_subtypes s ON s.code = a.subtype_code
+     ORDER BY a.code`
+  ).all());
+});
+
+app.get('/api/reports/:type/data', auth, (req, res) => {
+  if (req.params.type !== 'approve' && !requireAccess(req, res)) return;
+  res.json(collectReport(req.params.type, req.query));
+});
+
+app.get('/api/reports/:type/pdf', auth, asyncRoute(async (req, res) => {
+  if (req.params.type !== 'approve' && !requireAccess(req, res)) return;
+  const pdf = await buildPdf(req.params.type, req.query);
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="${req.params.type}.pdf"`);
+  res.send(pdf);
+}));
+
+app.get('/api/users', auth, allow('SAdmin'), (_req, res) => {
+  res.json(db.prepare(
+    'SELECT id, username, title, group_code, active, company FROM users ORDER BY username'
+  ).all());
+});
+
+app.post('/api/users', auth, allow('SAdmin'), asyncRoute((req, res) => {
+  const username = String(req.body.username || '').trim();
+  const password = String(req.body.password || '');
+  const group = String(req.body.group || '').trim();
+  if (!username || !password || !group) bad('Username, password, and category are required');
+  if (password.length < 4) bad('Password must be at least 4 characters');
+  const exists = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+  if (exists) return res.status(400).json({ error: 'That username already exists' });
+  const info = db.prepare(
+    `INSERT INTO users (username, password_hash, title, group_code, active, company, station_id)
+     VALUES (?, ?, ?, ?, 1, 'Gold Store', 'Gold Store')`
+  ).run(username, bcrypt.hashSync(password, 10), req.body.title || username, group);
+  res.json({ id: info.lastInsertRowid });
+}));
+
+app.get('/api/accounts', auth, allow('Account'), (_req, res) => {
+  res.json({
+    groups: db.prepare('SELECT * FROM account_groups ORDER BY code').all(),
+    subtypes: db.prepare('SELECT * FROM account_subtypes ORDER BY code').all(),
+    accounts: db.prepare(
+      `SELECT a.*, g.description AS group_name, s.description AS subtype_name
+       FROM accounts a
+       LEFT JOIN account_groups g ON g.code = a.group_code
+       LEFT JOIN account_subtypes s ON s.code = a.subtype_code
+       ORDER BY a.code`
+    ).all(),
+  });
+});
+
+app.post('/api/accounts', auth, allow('Account'), (req, res) => {
+  const name = String(req.body.name || '').trim();
+  const groupCode = String(req.body.groupCode || '').trim();
+  const subtypeCode = String(req.body.subtypeCode || '').trim();
+  if (!name || !groupCode) return res.status(400).json({ error: 'Account name and type are required' });
+  const max = db.prepare('SELECT MAX(code) AS code FROM accounts WHERE group_code = ?').get(groupCode);
+  let code = req.body.code ? String(req.body.code) : '';
+  if (!code) {
+    if (max && max.code) code = String(Number(max.code) + 1);
+    else code = `${groupCode}1`;
+  }
+  const normal = ['100000', '150000', '350000'].includes(groupCode) ? 'Debit' : 'Credit';
+  db.prepare(
+    `INSERT INTO accounts (code, name, group_code, subtype_code, normal_balance, opening, payable_acc, settings, bank_name, bank_account, company)
+     VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, 'Gold Store')`
+  ).run(code, name, groupCode, subtypeCode, normal, num(req.body.opening), req.body.payableAcc || '', req.body.bankName || '', req.body.bankAccount || '');
+  res.json({ code });
+});
+
+app.put('/api/accounts/:code', auth, allow('Account'), (req, res) => {
+  db.prepare('UPDATE accounts SET name = ?, payable_acc = COALESCE(?, payable_acc) WHERE code = ?').run(
+    String(req.body.name || '').trim(),
+    req.body.payableAcc,
+    req.params.code
+  );
+  res.json({ ok: true });
+});
+
+app.put('/api/accounts/settings/map', auth, allow('Account', 'SAdmin'), (req, res) => {
+  const role = String(req.body.settings || '').trim();
+  const code = String(req.body.code || '').trim();
+  if (!role || !code) return res.status(400).json({ error: 'Choose a role and an account' });
+  const save = db.transaction(() => {
+    db.prepare('UPDATE accounts SET settings = \'\' WHERE settings = ?').run(role);
+    db.prepare('UPDATE accounts SET settings = ? WHERE code = ?').run(role, code);
+  });
+  save();
+  res.json({ ok: true });
+});
+
+app.get('/api/journal/next', auth, allow('Account'), (_req, res) => {
+  res.json(biz.nextDoc('JOU', 'journal', 'id'));
+});
+
+app.get('/api/journal', auth, allow('Account'), (req, res) => {
+  const glNo = String(req.query.glNo || '');
+  if (!glNo) return res.json([]);
+  res.json(db.prepare('SELECT * FROM journal WHERE gl_no = ? ORDER BY id').all(glNo));
+});
+
+app.post('/api/journal', auth, allow('Account'), (req, res) => {
+  const lines = Array.isArray(req.body.lines) ? req.body.lines : [];
+  if (!lines.length) return res.status(400).json({ error: 'Add at least one journal line' });
+  const date = req.body.date || today();
+  const { number } = biz.nextDoc('JOU', 'journal', 'id');
+  const glNo = req.body.glNo || number;
+  const save = db.transaction(() => {
+    for (const line of lines) {
+      const debit = num(line.debit);
+      const credit = num(line.credit);
+      if (debit === 0 && credit === 0) continue;
+      biz.postJournal({
+        glNo,
+        description: line.description || line.name || '',
+        remarks: line.remarks || req.body.remarks || '',
+        amount: debit !== 0 ? debit : credit,
+        date,
+        user: req.user.username,
+        dc: debit !== 0 ? 'D' : 'C',
+        accNo: line.accNo || line.code || '',
+        docNo: glNo,
+        accountName: line.name || '',
+        glType: 'Jou',
+      });
+    }
+  });
+  save();
+  biz.audit(req.user.username, 'JOURNAL', glNo, 'Post journal');
+  res.json({ glNo });
+});
+
+app.post('/api/cash/transfer', auth, allow('Account'), (req, res) => {
+  const from = String(req.body.from || '');
+  const to = String(req.body.to || '');
+  const amount = num(req.body.amount);
+  const date = req.body.date || today();
+  const desc = req.body.description || `Transfer ${from} to ${to}`;
+  if (!from || !to || from === to) return res.status(400).json({ error: 'Choose two different cash accounts' });
+  if (amount <= 0) return res.status(400).json({ error: 'Enter a transfer amount' });
+  const allowed = new Set(['15001', '15002', '15003']);
+  if (!allowed.has(from) || !allowed.has(to)) return res.status(400).json({ error: 'Unknown cash account' });
+  const save = db.transaction(() => {
+    if (to === '15002') biz.postCash('main_cash', date, '', desc, 0, amount, `From ${from}`);
+    if (from === '15002') biz.postCash('main_cash', date, '', desc, amount, 0, `To ${to}`);
+    if (to === '15003') biz.postCash('petty_cash', date, '', desc, 0, amount, `From ${from}`);
+    if (from === '15003') biz.postCash('petty_cash', date, '', desc, amount, 0, `To ${to}`);
+  });
+  save();
+  res.json({ ok: true });
+});
+
+app.get('/api/cash/petty', auth, allow('Account'), (req, res) => {
+  const date = req.query.date || today();
+  res.json(db.prepare('SELECT * FROM petty_cash WHERE date = ? ORDER BY id').all(date));
+});
+
+app.post('/api/cash/petty', auth, allow('Account'), (req, res) => {
+  const date = req.body.date || today();
+  const lines = Array.isArray(req.body.lines) ? req.body.lines : [];
+  const save = db.transaction(() => {
+    db.prepare('DELETE FROM petty_cash WHERE date = ? AND description = ?').run(date, 'Expenses');
+    for (const line of lines) {
+      const amount = num(line.amount);
+      if (amount <= 0) continue;
+      biz.postCash('petty_cash', date, '', 'Expenses', amount, 0, line.remarks || line.description || '');
+    }
+  });
+  save();
+  res.json({ ok: true });
+});
+
+app.post('/api/notes/debit', auth, allow('Account'), (req, res) => {
+  const amount = num(req.body.amount);
+  const date = req.body.date || today();
+  if (!req.body.supplierAcc || !req.body.expenseAcc) return res.status(400).json({ error: 'Choose both accounts' });
+  if (amount <= 0) return res.status(400).json({ error: 'Enter an amount' });
+  let vat = 0;
+  let expenseAmount = amount;
+  if (String(req.body.taxType || '').toUpperCase() === 'VAT') {
+    vat = biz.round2(amount * 0.08);
+    expenseAmount = biz.round2(amount - vat);
+  }
+  const { code, number } = biz.nextDoc('DN', 'debit_notes', 'doc_code');
+  const save = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO debit_notes (doc_code, note_no, date, debit_acc, credit_acc, amount, vat, setoff_inv, tax_type, user_name, remarks)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(code, number, date, req.body.supplierAcc, req.body.expenseAcc, amount, vat, req.body.setoffInv || '', req.body.taxType || '', req.user.username, req.body.remarks || '');
+    biz.postJournal({
+      glNo: number, description: 'Debit Note', remarks: 'Debit Note', amount, date,
+      user: req.user.username, dc: 'D', accNo: req.body.supplierAcc, docNo: number,
+      accountName: req.body.supplierName || '', glType: 'DN',
+    });
+    biz.postJournal({
+      glNo: number, description: 'Debit Note', remarks: 'Debit Note', amount: expenseAmount, date,
+      user: req.user.username, dc: 'C', accNo: req.body.expenseAcc, docNo: number,
+      accountName: req.body.expenseName || '', glType: 'DN',
+    });
+  });
+  save();
+  res.json({ noteNo: number, vat, expenseAmount });
+});
+
+app.post('/api/notes/credit', auth, allow('Account'), (req, res) => {
+  const amount = num(req.body.amount);
+  const date = req.body.date || today();
+  if (!req.body.supplierAcc || !req.body.expenseAcc) return res.status(400).json({ error: 'Choose both accounts' });
+  if (amount <= 0) return res.status(400).json({ error: 'Enter an amount' });
+  const { code, number } = biz.nextDoc('CR', 'credit_notes', 'doc_code');
+  const save = db.transaction(() => {
+    db.prepare(
+      `INSERT INTO credit_notes (doc_code, note_no, date, debit_acc, credit_acc, amount, setoff_inv, user_name, remarks)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(code, number, date, req.body.expenseAcc, req.body.supplierAcc, amount, req.body.setoffInv || '', req.user.username, req.body.remarks || '');
+    biz.postJournal({
+      glNo: number, description: 'Credit Note', remarks: 'Voucher', amount, date,
+      user: req.user.username, dc: 'C', accNo: req.body.supplierAcc, docNo: number,
+      accountName: req.body.supplierName || '', glType: 'CR',
+    });
+    biz.postJournal({
+      glNo: number, description: 'Credit Note', remarks: 'Voucher', amount, date,
+      user: req.user.username, dc: 'D', accNo: req.body.expenseAcc, docNo: number,
+      accountName: req.body.expenseName || '', glType: 'CR',
+    });
+  });
+  save();
+  res.json({ noteNo: number });
+});
+
+app.get('/api/notes', auth, allow('Account'), (_req, res) => {
+  res.json({
+    debit: db.prepare('SELECT * FROM debit_notes ORDER BY id DESC LIMIT 50').all(),
+    credit: db.prepare('SELECT * FROM credit_notes ORDER BY id DESC LIMIT 50').all(),
+  });
+});
+
+const webDist = path.join(__dirname, '..', '..', 'frontend', 'dist');
+if (fs.existsSync(webDist)) {
+  app.use(express.static(webDist));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) return next();
+    res.sendFile(path.join(webDist, 'index.html'));
+  });
+}
+
+app.use((err, _req, res, _next) => {
+  const status = err.status || 500;
+  if (status >= 500) console.error(err);
+  res.status(status).json({ error: err.message || 'Something went wrong' });
+});
+
+app.listen(PORT, HOST, () => {
+  console.log(`Gold Store API listening on http://${HOST}:${PORT}`);
+});
