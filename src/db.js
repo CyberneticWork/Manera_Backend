@@ -233,7 +233,7 @@ function seed() {
              150000, 0, 'sadmin')`
   ).run(today());
   db.prepare(
-    `INSERT INTO client_items (doc_no, nic, date, category, item_name, condition, weight, rate, description)
+    `INSERT INTO client_items (doc_no, nic, date, category, item_name, \`condition\`, weight, rate, description)
      VALUES ('1', '199012345678', ?, 'Gold', 'Ring', 'Used', 22.5, '22K', 'Sample ring')`
   ).run(today());
 }

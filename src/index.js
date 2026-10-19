@@ -223,7 +223,7 @@ app.get('/api/clients/next/code', auth, allow('CallCenter', 'SAdmin'), (_req, re
 function saveItems(docNo, nic, date, items) {
   db.prepare('DELETE FROM client_items WHERE doc_no = ?').run(docNo);
   const insert = db.prepare(
-    `INSERT INTO client_items (doc_no, nic, date, category, item_name, condition, weight, rate, description)
+    `INSERT INTO client_items (doc_no, nic, date, category, item_name, \`condition\`, weight, rate, description)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   for (const item of items || []) {
