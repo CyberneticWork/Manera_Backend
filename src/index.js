@@ -7,6 +7,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const storage = require('./storage');
+const acl = require('./acl');
 const { db, today, ensureOpening } = require('./db');
 const biz = require('./business');
 const { build: buildPdf, collect: collectReport } = require('./pdfs');
@@ -34,7 +35,8 @@ function sign(user) {
 
 function auth(req, res, next) {
   const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  let token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!token && String(req.path).startsWith('/api/media') && req.query.token) token = String(req.query.token);
   if (!token) return res.status(401).json({ error: 'Login required' });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
@@ -44,10 +46,10 @@ function auth(req, res, next) {
   }
 }
 
-function allow(...roles) {
+function permit(...keys) {
   return (req, res, next) => {
-    if (req.user.group === 'SAdmin' || roles.includes(req.user.group)) return next();
-    res.status(403).json({ error: 'Your role cannot open this screen' });
+    if (acl.can(req.user.group, keys)) return next();
+    res.status(403).json({ error: 'Your access list does not include this action' });
   };
 }
 
@@ -59,6 +61,19 @@ function bad(message) {
   const err = new Error(message);
   err.status = 400;
   throw err;
+}
+
+function imageContentType(name) {
+  const ext = path.extname(name || '').toLowerCase();
+  return {
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
+    '.heic': 'image/heic',
+    '.bmp': 'image/bmp',
+  }[ext] || '';
 }
 
 function num(value) {
@@ -89,6 +104,7 @@ app.post('/api/auth/login', asyncRoute((req, res) => {
       group: user.group_code,
       company: user.company,
     },
+    permissions: acl.permissionsFor(user.group_code),
     opening,
     company: {
       name: biz.setting('company_name', 'Gold Store'),
@@ -103,12 +119,44 @@ app.get('/api/auth/me', auth, (req, res) => {
   if (!user) return res.status(401).json({ error: 'User not found' });
   res.json({
     user: { id: user.id, username: user.username, title: user.title, group: user.group_code, company: user.company },
+    permissions: acl.permissionsFor(user.group_code),
     company: {
       name: biz.setting('company_name', 'Gold Store'),
       address: biz.setting('company_address', ''),
       phone: biz.setting('company_phone', ''),
     },
   });
+});
+
+app.get('/api/acl', auth, permit('acl'), (_req, res) => {
+  res.json(acl.matrix());
+});
+
+app.put('/api/acl', auth, permit('acl'), (req, res) => {
+  const saved = acl.saveMatrix(req.body.roles || {});
+  biz.audit(req.user.username, 'ACL', '*', 'Update access list');
+  res.json(saved);
+});
+
+app.get('/api/firebase/status', auth, (_req, res) => {
+  res.json({ configured: storage.configured() });
+});
+
+app.get('/api/firebase', auth, permit('firebase'), (_req, res) => {
+  res.json(storage.publicStatus());
+});
+
+app.put('/api/firebase', auth, permit('firebase'), (req, res) => {
+  const bucket = String(req.body.bucket || '').trim();
+  const projectId = String(req.body.projectId || '').trim();
+  const clientEmail = String(req.body.clientEmail || '').trim();
+  const privateKey = String(req.body.privateKey || '').trim();
+  if (bucket) biz.setSetting('firebase_bucket', bucket);
+  if (projectId) biz.setSetting('firebase_project_id', projectId);
+  if (clientEmail) biz.setSetting('firebase_client_email', clientEmail);
+  if (privateKey) biz.setSetting('firebase_private_key', privateKey.replace(/\\n/g, '\n'));
+  biz.audit(req.user.username, 'FIREBASE', bucket || 'firebase', 'Update storage config');
+  res.json(storage.publicStatus());
 });
 
 app.get('/api/dashboard', auth, (req, res) => {
@@ -169,7 +217,7 @@ app.get('/api/lookups', auth, (_req, res) => {
   res.json(grouped);
 });
 
-app.post('/api/lookups', auth, allow('SAdmin', 'CallCenter', 'Cashier', 'Account'), asyncRoute((req, res) => {
+app.post('/api/lookups', auth, permit('masters'), asyncRoute((req, res) => {
   const type = String(req.body.type || '').trim();
   const description = String(req.body.description || '').trim();
   const category = req.body.category ? String(req.body.category).trim() : null;
@@ -178,7 +226,7 @@ app.post('/api/lookups', auth, allow('SAdmin', 'CallCenter', 'Cashier', 'Account
   res.json({ id: info.lastInsertRowid, type, description, category });
 }));
 
-app.put('/api/lookups/:id', auth, allow('SAdmin', 'CallCenter', 'Cashier', 'Account'), (req, res) => {
+app.put('/api/lookups/:id', auth, permit('masters'), (req, res) => {
   const description = String(req.body.description || '').trim();
   if (!description) return res.status(400).json({ error: 'Description is required' });
   db.prepare('UPDATE lookups SET description = ?, category = ? WHERE id = ?').run(
@@ -189,7 +237,7 @@ app.put('/api/lookups/:id', auth, allow('SAdmin', 'CallCenter', 'Cashier', 'Acco
   res.json({ ok: true });
 });
 
-app.delete('/api/lookups/:id', auth, allow('SAdmin'), (req, res) => {
+app.delete('/api/lookups/:id', auth, permit('masters'), (req, res) => {
   db.prepare('DELETE FROM lookups WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
 });
@@ -198,7 +246,7 @@ function jobPayload(row, items, images, documents) {
   return { ...row, items, images, documents: documents || [] };
 }
 
-app.get('/api/clients', auth, allow('CallCenter', 'SAdmin', 'Cashier', 'Account', 'History'), (req, res) => {
+app.get('/api/clients', auth, permit('clients', 'cashier', 'history'), (req, res) => {
   const status = req.query.status === undefined ? 0 : Number(req.query.status);
   const rows = db.prepare(
     `SELECT doc_no, agent_name, mobile_no, date, name, nic, location, total_amount, job_type, status, reject
@@ -207,7 +255,7 @@ app.get('/api/clients', auth, allow('CallCenter', 'SAdmin', 'Cashier', 'Account'
   res.json(rows);
 });
 
-app.get('/api/clients/:docNo', auth, (req, res) => {
+app.get('/api/clients/:docNo', auth, permit('clients', 'cashier', 'history', 'approvals'), (req, res) => {
   const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
   if (!header) return res.status(404).json({ error: 'Job not found' });
   const items = db.prepare('SELECT * FROM client_items WHERE doc_no = ? ORDER BY id').all(req.params.docNo);
@@ -216,7 +264,7 @@ app.get('/api/clients/:docNo', auth, (req, res) => {
   res.json(jobPayload(header, items, images, documents));
 });
 
-app.get('/api/clients/next/code', auth, allow('CallCenter', 'SAdmin'), (_req, res) => {
+app.get('/api/clients/next/code', auth, permit('clients'), (_req, res) => {
   res.json(biz.nextDocNo());
 });
 
@@ -241,7 +289,7 @@ function saveItems(docNo, nic, date, items) {
   }
 }
 
-app.post('/api/clients', auth, allow('CallCenter', 'SAdmin'), asyncRoute((req, res) => {
+app.post('/api/clients', auth, permit('clients'), asyncRoute((req, res) => {
   const body = req.body || {};
   if (!body.name || !body.mobileNo) bad('Customer name and mobile number are required');
   const { docNo, code } = biz.nextDocNo();
@@ -269,7 +317,7 @@ app.post('/api/clients', auth, allow('CallCenter', 'SAdmin'), asyncRoute((req, r
   res.json({ docNo, code });
 }));
 
-app.put('/api/clients/:docNo', auth, allow('CallCenter', 'SAdmin', 'Cashier', 'Account'), asyncRoute((req, res) => {
+app.put('/api/clients/:docNo', auth, permit('clients', 'cashier'), asyncRoute((req, res) => {
   const existing = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
   if (!existing) return res.status(404).json({ error: 'Job not found' });
   if (existing.status === 1 && req.user.group !== 'SAdmin') {
@@ -309,7 +357,7 @@ app.put('/api/clients/:docNo', auth, allow('CallCenter', 'SAdmin', 'Cashier', 'A
   res.json({ ok: true });
 }));
 
-app.post('/api/clients/:docNo/reject', auth, allow('CallCenter', 'SAdmin'), (req, res) => {
+app.post('/api/clients/:docNo/reject', auth, permit('clients'), (req, res) => {
   const row = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
   if (!row) return res.status(404).json({ error: 'Job not found' });
   const reject = db.transaction(() => {
@@ -331,15 +379,16 @@ app.post('/api/clients/:docNo/reject', auth, allow('CallCenter', 'SAdmin'), (req
   res.json({ ok: true });
 });
 
-app.post('/api/clients/:docNo/images', auth, allow('CallCenter', 'SAdmin', 'Cashier'), upload.single('image'), asyncRoute(async (req, res) => {
+app.post('/api/clients/:docNo/images', auth, permit('clients', 'cashier'), upload.single('image'), asyncRoute(async (req, res) => {
   const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
   if (!header) return res.status(404).json({ error: 'Job not found' });
   if (!req.file) return res.status(400).json({ error: 'Choose an image' });
-  if (!/^image\//.test(req.file.mimetype)) return res.status(400).json({ error: 'Choose an image file' });
+  const contentType = /^image\//.test(req.file.mimetype) ? req.file.mimetype : imageContentType(req.file.originalname);
+  if (!contentType) return res.status(400).json({ error: 'Choose an image file' });
   const count = db.prepare('SELECT COUNT(*) AS c FROM client_images WHERE doc_no = ?').get(req.params.docNo).c;
   const stored = await storage.uploadObject({
     buffer: req.file.buffer,
-    contentType: req.file.mimetype,
+    contentType,
     originalName: req.file.originalname,
     folder: `clients/${req.params.docNo}/images`,
   });
@@ -349,7 +398,27 @@ app.post('/api/clients/:docNo/images', auth, allow('CallCenter', 'SAdmin', 'Cash
   res.json({ id: info.lastInsertRowid, url: stored.url, type: req.body.type || 'Item' });
 }));
 
-app.delete('/api/clients/:docNo/images/:id', auth, allow('CallCenter', 'SAdmin'), asyncRoute(async (req, res) => {
+app.get('/api/media/images/:id', auth, permit('clients', 'cashier', 'history', 'approvals', 'reports'), asyncRoute(async (req, res) => {
+  const image = db.prepare('SELECT * FROM client_images WHERE id = ?').get(req.params.id);
+  if (!image) return res.status(404).json({ error: 'Image not found' });
+  if (!image.storage_path) return res.redirect(image.url);
+  const file = await storage.readObject(image.storage_path);
+  res.set('Content-Type', file.contentType);
+  res.set('Cache-Control', 'private, max-age=300');
+  res.send(file.buffer);
+}));
+
+app.get('/api/media/documents/:id', auth, permit('clients', 'cashier', 'history', 'approvals'), asyncRoute(async (req, res) => {
+  const document = db.prepare('SELECT * FROM client_documents WHERE id = ?').get(req.params.id);
+  if (!document) return res.status(404).json({ error: 'Document not found' });
+  if (!document.storage_path) return res.redirect(document.url);
+  const file = await storage.readObject(document.storage_path);
+  res.set('Content-Type', file.contentType);
+  res.set('Content-Disposition', `inline; filename="${String(document.file_name || 'document').replace(/"/g, '')}"`);
+  res.send(file.buffer);
+}));
+
+app.delete('/api/clients/:docNo/images/:id', auth, permit('clients', 'cashier'), asyncRoute(async (req, res) => {
   const image = db.prepare('SELECT * FROM client_images WHERE id = ? AND doc_no = ?').get(req.params.id, req.params.docNo);
   if (!image) return res.status(404).json({ error: 'Image not found' });
   await storage.deleteObject(image.storage_path);
@@ -357,7 +426,7 @@ app.delete('/api/clients/:docNo/images/:id', auth, allow('CallCenter', 'SAdmin')
   res.json({ ok: true });
 }));
 
-app.post('/api/clients/:docNo/documents', auth, allow('CallCenter', 'SAdmin', 'Cashier'), upload.single('document'), asyncRoute(async (req, res) => {
+app.post('/api/clients/:docNo/documents', auth, permit('clients', 'cashier'), upload.single('document'), asyncRoute(async (req, res) => {
   const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
   if (!header) return res.status(404).json({ error: 'Job not found' });
   if (!req.file) return res.status(400).json({ error: 'Choose a document' });
@@ -377,7 +446,7 @@ app.post('/api/clients/:docNo/documents', auth, allow('CallCenter', 'SAdmin', 'C
   res.json({ id: info.lastInsertRowid, url: stored.url, fileName: req.file.originalname });
 }));
 
-app.delete('/api/clients/:docNo/documents/:id', auth, allow('CallCenter', 'SAdmin'), asyncRoute(async (req, res) => {
+app.delete('/api/clients/:docNo/documents/:id', auth, permit('clients', 'cashier'), asyncRoute(async (req, res) => {
   const document = db.prepare('SELECT * FROM client_documents WHERE id = ? AND doc_no = ?').get(req.params.id, req.params.docNo);
   if (!document) return res.status(404).json({ error: 'Document not found' });
   await storage.deleteObject(document.storage_path);
@@ -385,7 +454,7 @@ app.delete('/api/clients/:docNo/documents/:id', auth, allow('CallCenter', 'SAdmi
   res.json({ ok: true });
 }));
 
-app.get('/api/history', auth, (req, res) => {
+app.get('/api/history', auth, permit('history'), (req, res) => {
   const mode = req.query.mode || 'all';
   const q = String(req.query.q || '').trim();
   let sql = `SELECT doc_no, nic, name, mobile_no, location, agent_name, rider_name, job_type, date, total_amount, status
@@ -422,7 +491,7 @@ function loadOpenJob(where, value) {
   ).get(value);
 }
 
-app.get('/api/cashier/lookup', auth, allow('Cashier', 'Account'), (req, res) => {
+app.get('/api/cashier/lookup', auth, permit('cashier'), (req, res) => {
   const date = req.query.date || today();
   if (!biz.withinSevenDays(date)) {
     return res.status(400).json({ error: 'Please select a date within the last 7 days', jobNo: null });
@@ -449,13 +518,13 @@ app.get('/api/cashier/lookup', auth, allow('Cashier', 'Account'), (req, res) => 
   });
 });
 
-app.get('/api/cashier/job-no', auth, allow('Cashier', 'Account'), (req, res) => {
+app.get('/api/cashier/job-no', auth, permit('cashier'), (req, res) => {
   const date = req.query.date || today();
   if (!biz.withinSevenDays(date)) return res.status(400).json({ error: 'Please select a date within the last 7 days' });
   res.json(biz.nextJobNo(date));
 });
 
-app.post('/api/cashier/finalize', auth, allow('Cashier', 'Account'), asyncRoute((req, res) => {
+app.post('/api/cashier/finalize', auth, permit('cashier'), asyncRoute((req, res) => {
   const docNo = String(req.body.docNo || '').trim();
   const date = req.body.date || today();
   const amount = num(req.body.amount);
@@ -501,7 +570,7 @@ app.post('/api/cashier/finalize', auth, allow('Cashier', 'Account'), asyncRoute(
   res.json({ jobNo, code, agentCommission, riderCommission, totals });
 }));
 
-app.post('/api/cashier/cancel', auth, allow('Cashier', 'Account', 'SAdmin'), (req, res) => {
+app.post('/api/cashier/cancel', auth, permit('cashier'), (req, res) => {
   const jobNo = String(req.body.jobNo || '').trim();
   const row = db.prepare('SELECT * FROM finalized WHERE job_no = ?').get(jobNo);
   if (!row) return res.status(404).json({ error: 'Finalized job not found' });
@@ -515,7 +584,7 @@ app.post('/api/cashier/cancel', auth, allow('Cashier', 'Account', 'SAdmin'), (re
   res.json({ ok: true, docNo: row.doc_no });
 });
 
-app.get('/api/calls', auth, allow('CallCenter'), (req, res) => {
+app.get('/api/calls', auth, permit('calls'), (req, res) => {
   const contact = String(req.query.contact || '').trim();
   if (!contact) return res.json([]);
   const rows = db.prepare(
@@ -524,7 +593,7 @@ app.get('/api/calls', auth, allow('CallCenter'), (req, res) => {
   res.json(rows);
 });
 
-app.post('/api/calls', auth, allow('CallCenter'), (req, res) => {
+app.post('/api/calls', auth, permit('calls'), (req, res) => {
   const contact = String(req.body.contactNo || '').trim();
   const reason = String(req.body.reason || '').trim();
   if (!contact || !reason) return res.status(400).json({ error: 'Contact number and comments are required' });
@@ -536,11 +605,11 @@ app.post('/api/calls', auth, allow('CallCenter'), (req, res) => {
   res.json({ id: info.lastInsertRowid });
 });
 
-app.get('/api/assignments', auth, allow('CallCenter'), (_req, res) => {
+app.get('/api/assignments', auth, permit('assign'), (_req, res) => {
   res.json(db.prepare('SELECT * FROM mobile_assignments ORDER BY user_name, mobile_no').all());
 });
 
-app.post('/api/assignments', auth, allow('CallCenter'), (req, res) => {
+app.post('/api/assignments', auth, permit('assign'), (req, res) => {
   const userName = String(req.body.userName || '').trim();
   const mobileNo = String(req.body.mobileNo || '').trim();
   if (!userName || !mobileNo) return res.status(400).json({ error: 'User and mobile number are required' });
@@ -550,7 +619,7 @@ app.post('/api/assignments', auth, allow('CallCenter'), (req, res) => {
   res.json({ id: info.lastInsertRowid });
 });
 
-app.post('/api/assignments/replace', auth, allow('CallCenter', 'SAdmin'), (req, res) => {
+app.post('/api/assignments/replace', auth, permit('assign'), (req, res) => {
   const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
   const save = db.transaction(() => {
     db.prepare('DELETE FROM mobile_assignments').run();
@@ -563,7 +632,7 @@ app.post('/api/assignments/replace', auth, allow('CallCenter', 'SAdmin'), (req, 
   res.json({ ok: true });
 });
 
-app.post('/api/assignments/transfer', auth, allow('CallCenter', 'SAdmin'), (req, res) => {
+app.post('/api/assignments/transfer', auth, permit('assign'), (req, res) => {
   const fromUser = String(req.body.fromUser || '').trim();
   const toUser = String(req.body.toUser || '').trim();
   if (!fromUser || !toUser) return res.status(400).json({ error: 'Choose both agents' });
@@ -571,7 +640,7 @@ app.post('/api/assignments/transfer', auth, allow('CallCenter', 'SAdmin'), (req,
   res.json({ ok: true });
 });
 
-app.get('/api/assignments/mine', auth, (req, res) => {
+app.get('/api/assignments/mine', auth, permit('calls', 'assign', 'clients'), (req, res) => {
   res.json(db.prepare('SELECT * FROM mobile_assignments WHERE user_name = ?').all(req.user.username));
 });
 
@@ -585,7 +654,7 @@ function approvalGuard(req, res) {
   return true;
 }
 
-app.get('/api/approvals', auth, allow('Admin'), (req, res) => {
+app.get('/api/approvals', auth, permit('approvals'), (req, res) => {
   if (!approvalGuard(req, res)) return;
   const date = req.query.date || today();
   const rows = db.prepare(
@@ -596,7 +665,7 @@ app.get('/api/approvals', auth, allow('Admin'), (req, res) => {
   res.json(rows);
 });
 
-app.get('/api/approvals/:jobNo', auth, allow('Admin'), (req, res) => {
+app.get('/api/approvals/:jobNo', auth, permit('approvals'), (req, res) => {
   if (!approvalGuard(req, res)) return;
   const row = db.prepare('SELECT * FROM finalized WHERE job_no = ?').get(req.params.jobNo);
   if (!row) return res.status(404).json({ error: 'Job not found' });
@@ -606,7 +675,7 @@ app.get('/api/approvals/:jobNo', auth, allow('Admin'), (req, res) => {
   res.json({ finalized: row, header, items, images });
 });
 
-app.post('/api/approvals/:jobNo/approve', auth, allow('Admin'), (req, res) => {
+app.post('/api/approvals/:jobNo/approve', auth, permit('approvals'), (req, res) => {
   if (!approvalGuard(req, res)) return;
   const info = db.prepare(
     'UPDATE finalized SET approved = 1, permission_granted = 1 WHERE job_no = ?'
@@ -623,7 +692,7 @@ app.post('/api/approvals/grant-permission', auth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/approvals/dashboard/day', auth, allow('Admin'), (req, res) => {
+app.get('/api/approvals/dashboard/day', auth, permit('approvals'), (req, res) => {
   if (!approvalGuard(req, res)) return;
   const date = req.query.date || today();
   const jobs = db.prepare('SELECT * FROM finalized WHERE finalized_date = ?').all(date);
@@ -648,14 +717,14 @@ app.get('/api/approvals/dashboard/day', auth, allow('Admin'), (req, res) => {
   });
 });
 
-app.get('/api/commission', auth, allow('Admin'), (_req, res) => {
+app.get('/api/commission', auth, permit('commission'), (_req, res) => {
   res.json({
     businessCommission: num(biz.setting('business_commission', '0')),
     riderCommission: num(biz.setting('rider_commission', '0')),
   });
 });
 
-app.put('/api/commission', auth, allow('Admin'), (req, res) => {
+app.put('/api/commission', auth, permit('commission'), (req, res) => {
   if (req.body.businessCommission !== undefined) biz.setSetting('business_commission', num(req.body.businessCommission));
   if (req.body.riderCommission !== undefined) biz.setSetting('rider_commission', num(req.body.riderCommission));
   res.json({
@@ -664,11 +733,11 @@ app.put('/api/commission', auth, allow('Admin'), (req, res) => {
   });
 });
 
-app.get('/api/access-codes', auth, allow('Admin'), (_req, res) => {
+app.get('/api/access-codes', auth, permit('access'), (_req, res) => {
   res.json(db.prepare('SELECT id, code, date, created_by FROM daily_codes ORDER BY date DESC LIMIT 60').all());
 });
 
-app.post('/api/access-codes', auth, allow('Admin'), (req, res) => {
+app.post('/api/access-codes', auth, permit('access'), (req, res) => {
   const date = req.body.date || today();
   let code = String(req.body.code || '').replace(/\s/g, '');
   if (code.length >= 3 && !code.includes('#')) code = `${code.slice(0, 3)}#${code.slice(3)}`;
@@ -698,7 +767,7 @@ function requireAccess(req, res) {
   return date;
 }
 
-app.get('/api/reports/bought', auth, (req, res) => {
+app.get('/api/reports/bought', auth, permit('reports'), (req, res) => {
   if (!requireAccess(req, res)) return;
   const from = req.query.from || today();
   const to = req.query.to || from;
@@ -708,7 +777,7 @@ app.get('/api/reports/bought', auth, (req, res) => {
   res.json(rows);
 });
 
-app.get('/api/reports/summary', auth, (req, res) => {
+app.get('/api/reports/summary', auth, permit('reports'), (req, res) => {
   if (!requireAccess(req, res)) return;
   const from = req.query.from || today();
   const to = req.query.to || from;
@@ -721,7 +790,7 @@ app.get('/api/reports/summary', auth, (req, res) => {
   res.json(rows);
 });
 
-app.get('/api/reports/main-cash', auth, (req, res) => {
+app.get('/api/reports/main-cash', auth, permit('reports'), (req, res) => {
   if (!requireAccess(req, res)) return;
   const date = req.query.from || today();
   const opening = ensureOpening(date);
@@ -729,20 +798,20 @@ app.get('/api/reports/main-cash', auth, (req, res) => {
   res.json({ opening, rows });
 });
 
-app.get('/api/reports/petty-cash', auth, (req, res) => {
+app.get('/api/reports/petty-cash', auth, permit('reports'), (req, res) => {
   if (!requireAccess(req, res)) return;
   const date = req.query.from || today();
   res.json(db.prepare('SELECT * FROM petty_cash WHERE date = ? ORDER BY id').all(date));
 });
 
-app.get('/api/reports/journal', auth, (req, res) => {
+app.get('/api/reports/journal', auth, permit('reports'), (req, res) => {
   if (!requireAccess(req, res)) return;
   const from = req.query.from || today();
   const to = req.query.to || from;
   res.json(db.prepare('SELECT * FROM journal WHERE date >= ? AND date <= ? ORDER BY id').all(from, to));
 });
 
-app.get('/api/reports/chart', auth, (req, res) => {
+app.get('/api/reports/chart', auth, permit('reports'), (req, res) => {
   if (!requireAccess(req, res)) return;
   res.json(db.prepare(
     `SELECT a.code, a.name, g.description AS group_name, s.description AS subtype_name, a.normal_balance, a.opening, a.settings
@@ -753,12 +822,12 @@ app.get('/api/reports/chart', auth, (req, res) => {
   ).all());
 });
 
-app.get('/api/reports/:type/data', auth, (req, res) => {
+app.get('/api/reports/:type/data', auth, permit('reports'), (req, res) => {
   if (req.params.type !== 'approve' && !requireAccess(req, res)) return;
   res.json(collectReport(req.params.type, req.query));
 });
 
-app.get('/api/reports/:type/pdf', auth, asyncRoute(async (req, res) => {
+app.get('/api/reports/:type/pdf', auth, permit('reports'), asyncRoute(async (req, res) => {
   if (req.params.type !== 'approve' && !requireAccess(req, res)) return;
   const pdf = await buildPdf(req.params.type, req.query);
   res.setHeader('Content-Type', 'application/pdf');
@@ -766,13 +835,13 @@ app.get('/api/reports/:type/pdf', auth, asyncRoute(async (req, res) => {
   res.send(pdf);
 }));
 
-app.get('/api/users', auth, allow('SAdmin'), (_req, res) => {
+app.get('/api/users', auth, permit('users'), (_req, res) => {
   res.json(db.prepare(
     'SELECT id, username, title, group_code, active, company FROM users ORDER BY username'
   ).all());
 });
 
-app.post('/api/users', auth, allow('SAdmin'), asyncRoute((req, res) => {
+app.post('/api/users', auth, permit('users'), asyncRoute((req, res) => {
   const username = String(req.body.username || '').trim();
   const password = String(req.body.password || '');
   const group = String(req.body.group || '').trim();
@@ -787,7 +856,7 @@ app.post('/api/users', auth, allow('SAdmin'), asyncRoute((req, res) => {
   res.json({ id: info.lastInsertRowid });
 }));
 
-app.get('/api/accounts', auth, allow('Account'), (_req, res) => {
+app.get('/api/accounts', auth, permit('accounts'), (_req, res) => {
   res.json({
     groups: db.prepare('SELECT * FROM account_groups ORDER BY code').all(),
     subtypes: db.prepare('SELECT * FROM account_subtypes ORDER BY code').all(),
@@ -801,7 +870,7 @@ app.get('/api/accounts', auth, allow('Account'), (_req, res) => {
   });
 });
 
-app.post('/api/accounts', auth, allow('Account'), (req, res) => {
+app.post('/api/accounts', auth, permit('accounts'), (req, res) => {
   const name = String(req.body.name || '').trim();
   const groupCode = String(req.body.groupCode || '').trim();
   const subtypeCode = String(req.body.subtypeCode || '').trim();
@@ -820,7 +889,7 @@ app.post('/api/accounts', auth, allow('Account'), (req, res) => {
   res.json({ code });
 });
 
-app.put('/api/accounts/:code', auth, allow('Account'), (req, res) => {
+app.put('/api/accounts/:code', auth, permit('accounts'), (req, res) => {
   db.prepare('UPDATE accounts SET name = ?, payable_acc = COALESCE(?, payable_acc) WHERE code = ?').run(
     String(req.body.name || '').trim(),
     req.body.payableAcc,
@@ -829,7 +898,7 @@ app.put('/api/accounts/:code', auth, allow('Account'), (req, res) => {
   res.json({ ok: true });
 });
 
-app.put('/api/accounts/settings/map', auth, allow('Account', 'SAdmin'), (req, res) => {
+app.put('/api/accounts/settings/map', auth, permit('accounts'), (req, res) => {
   const role = String(req.body.settings || '').trim();
   const code = String(req.body.code || '').trim();
   if (!role || !code) return res.status(400).json({ error: 'Choose a role and an account' });
@@ -841,17 +910,17 @@ app.put('/api/accounts/settings/map', auth, allow('Account', 'SAdmin'), (req, re
   res.json({ ok: true });
 });
 
-app.get('/api/journal/next', auth, allow('Account'), (_req, res) => {
+app.get('/api/journal/next', auth, permit('accounts'), (_req, res) => {
   res.json(biz.nextDoc('JOU', 'journal', 'id'));
 });
 
-app.get('/api/journal', auth, allow('Account'), (req, res) => {
+app.get('/api/journal', auth, permit('accounts'), (req, res) => {
   const glNo = String(req.query.glNo || '');
   if (!glNo) return res.json([]);
   res.json(db.prepare('SELECT * FROM journal WHERE gl_no = ? ORDER BY id').all(glNo));
 });
 
-app.post('/api/journal', auth, allow('Account'), (req, res) => {
+app.post('/api/journal', auth, permit('accounts'), (req, res) => {
   const lines = Array.isArray(req.body.lines) ? req.body.lines : [];
   if (!lines.length) return res.status(400).json({ error: 'Add at least one journal line' });
   const date = req.body.date || today();
@@ -882,7 +951,7 @@ app.post('/api/journal', auth, allow('Account'), (req, res) => {
   res.json({ glNo });
 });
 
-app.post('/api/cash/transfer', auth, allow('Account'), (req, res) => {
+app.post('/api/cash/transfer', auth, permit('transfer'), (req, res) => {
   const from = String(req.body.from || '');
   const to = String(req.body.to || '');
   const amount = num(req.body.amount);
@@ -902,12 +971,12 @@ app.post('/api/cash/transfer', auth, allow('Account'), (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/cash/petty', auth, allow('Account'), (req, res) => {
+app.get('/api/cash/petty', auth, permit('expenses'), (req, res) => {
   const date = req.query.date || today();
   res.json(db.prepare('SELECT * FROM petty_cash WHERE date = ? ORDER BY id').all(date));
 });
 
-app.post('/api/cash/petty', auth, allow('Account'), (req, res) => {
+app.post('/api/cash/petty', auth, permit('expenses'), (req, res) => {
   const date = req.body.date || today();
   const lines = Array.isArray(req.body.lines) ? req.body.lines : [];
   const save = db.transaction(() => {
@@ -922,7 +991,7 @@ app.post('/api/cash/petty', auth, allow('Account'), (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/notes/debit', auth, allow('Account'), (req, res) => {
+app.post('/api/notes/debit', auth, permit('accounts'), (req, res) => {
   const amount = num(req.body.amount);
   const date = req.body.date || today();
   if (!req.body.supplierAcc || !req.body.expenseAcc) return res.status(400).json({ error: 'Choose both accounts' });
@@ -954,7 +1023,7 @@ app.post('/api/notes/debit', auth, allow('Account'), (req, res) => {
   res.json({ noteNo: number, vat, expenseAmount });
 });
 
-app.post('/api/notes/credit', auth, allow('Account'), (req, res) => {
+app.post('/api/notes/credit', auth, permit('accounts'), (req, res) => {
   const amount = num(req.body.amount);
   const date = req.body.date || today();
   if (!req.body.supplierAcc || !req.body.expenseAcc) return res.status(400).json({ error: 'Choose both accounts' });
@@ -980,7 +1049,7 @@ app.post('/api/notes/credit', auth, allow('Account'), (req, res) => {
   res.json({ noteNo: number });
 });
 
-app.get('/api/notes', auth, allow('Account'), (_req, res) => {
+app.get('/api/notes', auth, permit('accounts'), (_req, res) => {
   res.json({
     debit: db.prepare('SELECT * FROM debit_notes ORDER BY id DESC LIMIT 50').all(),
     credit: db.prepare('SELECT * FROM credit_notes ORDER BY id DESC LIMIT 50').all(),

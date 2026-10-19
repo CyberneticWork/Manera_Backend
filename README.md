@@ -26,7 +26,13 @@ Demo passwords: `sadmin` / `admin123`, `admin` / `admin123`, `cashier` / `cashie
 
 `prisma/schema.prisma` is the table definition. `npm run db:push` creates or updates the MySQL tables. The API reads and writes with SQL against those tables.
 
+## Access control
+
+Login returns a JWT and the screens that role may open. Super Admin edits the list under Access Control. Super Admin always keeps every screen. The list is stored in the `settings` table under the key `acl`.
+
 ## Firebase
+
+Open Firebase in the desk, or set the same values in `.env`. Values saved in the desk are used first.
 
 Set one of these in `.env`:
 
