@@ -72,6 +72,7 @@ function imageContentType(name) {
     '.webp': 'image/webp',
     '.gif': 'image/gif',
     '.heic': 'image/heic',
+    '.heif': 'image/heif',
     '.bmp': 'image/bmp',
   }[ext] || '';
 }
@@ -132,7 +133,7 @@ app.get('/api/acl', auth, permit('acl'), (_req, res) => {
   res.json(acl.matrix());
 });
 
-app.put('/api/acl', auth, permit('acl'), (req, res) => {
+app.put('/api/acl', auth, permit('acl:update'), (req, res) => {
   const saved = acl.saveMatrix(req.body.roles || {});
   biz.audit(req.user.username, 'ACL', '*', 'Update access list');
   res.json(saved);
@@ -146,7 +147,7 @@ app.get('/api/firebase', auth, permit('firebase'), (_req, res) => {
   res.json(storage.publicStatus());
 });
 
-app.put('/api/firebase', auth, permit('firebase'), (req, res) => {
+app.put('/api/firebase', auth, permit('firebase:update'), (req, res) => {
   const bucket = String(req.body.bucket || '').trim();
   const projectId = String(req.body.projectId || '').trim();
   const clientEmail = String(req.body.clientEmail || '').trim();
@@ -217,7 +218,7 @@ app.get('/api/lookups', auth, (_req, res) => {
   res.json(grouped);
 });
 
-app.post('/api/lookups', auth, permit('masters'), asyncRoute((req, res) => {
+app.post('/api/lookups', auth, permit('masters:create'), asyncRoute((req, res) => {
   const type = String(req.body.type || '').trim();
   const description = String(req.body.description || '').trim();
   const category = req.body.category ? String(req.body.category).trim() : null;
@@ -226,7 +227,7 @@ app.post('/api/lookups', auth, permit('masters'), asyncRoute((req, res) => {
   res.json({ id: info.lastInsertRowid, type, description, category });
 }));
 
-app.put('/api/lookups/:id', auth, permit('masters'), (req, res) => {
+app.put('/api/lookups/:id', auth, permit('masters:update'), (req, res) => {
   const description = String(req.body.description || '').trim();
   if (!description) return res.status(400).json({ error: 'Description is required' });
   db.prepare('UPDATE lookups SET description = ?, category = ? WHERE id = ?').run(
@@ -237,8 +238,8 @@ app.put('/api/lookups/:id', auth, permit('masters'), (req, res) => {
   res.json({ ok: true });
 });
 
-app.delete('/api/lookups/:id', auth, permit('masters'), (req, res) => {
-  db.prepare('DELETE FROM lookups WHERE id = ?').run(req.params.id);
+app.delete('/api/lookups/:id', auth, permit('masters:delete'), (req, res) => {
+  db.prepare('UPDATE lookups SET deleted = 1 WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
 });
 
@@ -269,7 +270,7 @@ app.get('/api/clients/next/code', auth, permit('clients'), (_req, res) => {
 });
 
 function saveItems(docNo, nic, date, items) {
-  db.prepare('DELETE FROM client_items WHERE doc_no = ?').run(docNo);
+  db.prepare('UPDATE client_items SET deleted = 1 WHERE doc_no = ? AND deleted = 0').run(docNo);
   const insert = db.prepare(
     `INSERT INTO client_items (doc_no, nic, date, category, item_name, \`condition\`, weight, rate, description)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -289,7 +290,7 @@ function saveItems(docNo, nic, date, items) {
   }
 }
 
-app.post('/api/clients', auth, permit('clients'), asyncRoute((req, res) => {
+app.post('/api/clients', auth, permit('clients:create'), asyncRoute((req, res) => {
   const body = req.body || {};
   if (!body.name || !body.mobileNo) bad('Customer name and mobile number are required');
   const { docNo, code } = biz.nextDocNo();
@@ -317,7 +318,7 @@ app.post('/api/clients', auth, permit('clients'), asyncRoute((req, res) => {
   res.json({ docNo, code });
 }));
 
-app.put('/api/clients/:docNo', auth, permit('clients', 'cashier'), asyncRoute((req, res) => {
+app.put('/api/clients/:docNo', auth, permit('clients:update', 'cashier:update'), asyncRoute((req, res) => {
   const existing = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
   if (!existing) return res.status(404).json({ error: 'Job not found' });
   if (existing.status === 1 && req.user.group !== 'SAdmin') {
@@ -357,7 +358,7 @@ app.put('/api/clients/:docNo', auth, permit('clients', 'cashier'), asyncRoute((r
   res.json({ ok: true });
 }));
 
-app.post('/api/clients/:docNo/reject', auth, permit('clients'), (req, res) => {
+app.post('/api/clients/:docNo/reject', auth, permit('clients:update'), (req, res) => {
   const row = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
   if (!row) return res.status(404).json({ error: 'Job not found' });
   const reject = db.transaction(() => {
@@ -379,7 +380,24 @@ app.post('/api/clients/:docNo/reject', auth, permit('clients'), (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/clients/:docNo/images', auth, permit('clients', 'cashier'), upload.single('image'), asyncRoute(async (req, res) => {
+app.delete('/api/clients/:docNo', auth, permit('clients:delete', 'history:delete', 'cashier:delete'), (req, res) => {
+  const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
+  if (!header) return res.status(404).json({ error: 'Job not found' });
+  const jobs = db.prepare('SELECT job_no FROM finalized WHERE doc_no = ? AND deleted >= 0').all(req.params.docNo);
+  const hide = db.transaction(() => {
+    db.prepare('UPDATE client_header SET deleted = 1 WHERE doc_no = ?').run(req.params.docNo);
+    db.prepare('UPDATE client_items SET deleted = 1 WHERE doc_no = ? AND deleted = 0').run(req.params.docNo);
+    db.prepare('UPDATE finalized SET deleted = 1 WHERE doc_no = ? AND deleted = 0').run(req.params.docNo);
+    for (const job of jobs) {
+      db.prepare('UPDATE main_cash SET deleted = 1 WHERE invoice_no = ? AND deleted = 0').run(job.job_no);
+    }
+  });
+  hide();
+  biz.audit(req.user.username, 'CLIENT', req.params.docNo, 'Hide job');
+  res.json({ ok: true });
+});
+
+app.post('/api/clients/:docNo/images', auth, permit('clients:update', 'cashier:update'), upload.single('image'), asyncRoute(async (req, res) => {
   const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
   if (!header) return res.status(404).json({ error: 'Job not found' });
   if (!req.file) return res.status(400).json({ error: 'Choose an image' });
@@ -418,7 +436,7 @@ app.get('/api/media/documents/:id', auth, permit('clients', 'cashier', 'history'
   res.send(file.buffer);
 }));
 
-app.delete('/api/clients/:docNo/images/:id', auth, permit('clients', 'cashier'), asyncRoute(async (req, res) => {
+app.delete('/api/clients/:docNo/images/:id', auth, permit('clients:delete', 'cashier:delete'), asyncRoute(async (req, res) => {
   const image = db.prepare('SELECT * FROM client_images WHERE id = ? AND doc_no = ?').get(req.params.id, req.params.docNo);
   if (!image) return res.status(404).json({ error: 'Image not found' });
   await storage.deleteObject(image.storage_path);
@@ -426,7 +444,7 @@ app.delete('/api/clients/:docNo/images/:id', auth, permit('clients', 'cashier'),
   res.json({ ok: true });
 }));
 
-app.post('/api/clients/:docNo/documents', auth, permit('clients', 'cashier'), upload.single('document'), asyncRoute(async (req, res) => {
+app.post('/api/clients/:docNo/documents', auth, permit('clients:update', 'cashier:update'), upload.single('document'), asyncRoute(async (req, res) => {
   const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
   if (!header) return res.status(404).json({ error: 'Job not found' });
   if (!req.file) return res.status(400).json({ error: 'Choose a document' });
@@ -446,7 +464,7 @@ app.post('/api/clients/:docNo/documents', auth, permit('clients', 'cashier'), up
   res.json({ id: info.lastInsertRowid, url: stored.url, fileName: req.file.originalname });
 }));
 
-app.delete('/api/clients/:docNo/documents/:id', auth, permit('clients', 'cashier'), asyncRoute(async (req, res) => {
+app.delete('/api/clients/:docNo/documents/:id', auth, permit('clients:delete', 'cashier:delete'), asyncRoute(async (req, res) => {
   const document = db.prepare('SELECT * FROM client_documents WHERE id = ? AND doc_no = ?').get(req.params.id, req.params.docNo);
   if (!document) return res.status(404).json({ error: 'Document not found' });
   await storage.deleteObject(document.storage_path);
@@ -524,13 +542,13 @@ app.get('/api/cashier/job-no', auth, permit('cashier'), (req, res) => {
   res.json(biz.nextJobNo(date));
 });
 
-app.post('/api/cashier/finalize', auth, permit('cashier'), asyncRoute((req, res) => {
+app.post('/api/cashier/finalize', auth, permit('cashier:create'), asyncRoute((req, res) => {
   const docNo = String(req.body.docNo || '').trim();
   const date = req.body.date || today();
   const amount = num(req.body.amount);
   if (!docNo) bad('Job number is required');
   if (!biz.withinSevenDays(date)) bad('Please select a date within the last 7 days');
-  if (amount <= 0) bad('Enter the final payout amount');
+  if (amount <= 0) bad('Last value should be entered and confirmed before finalize');
   const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ? AND reject = 0').get(docNo);
   if (!header) return res.status(404).json({ error: 'Job not found' });
   if (header.status === 1) return res.status(400).json({ error: 'This job is already finalized' });
@@ -570,14 +588,14 @@ app.post('/api/cashier/finalize', auth, permit('cashier'), asyncRoute((req, res)
   res.json({ jobNo, code, agentCommission, riderCommission, totals });
 }));
 
-app.post('/api/cashier/cancel', auth, permit('cashier'), (req, res) => {
+app.post('/api/cashier/cancel', auth, permit('cashier:delete'), (req, res) => {
   const jobNo = String(req.body.jobNo || '').trim();
   const row = db.prepare('SELECT * FROM finalized WHERE job_no = ?').get(jobNo);
   if (!row) return res.status(404).json({ error: 'Finalized job not found' });
   const cancel = db.transaction(() => {
-    db.prepare('DELETE FROM finalized WHERE job_no = ?').run(jobNo);
+    db.prepare('UPDATE finalized SET deleted = 1 WHERE job_no = ?').run(jobNo);
     db.prepare('UPDATE client_header SET status = 0 WHERE doc_no = ?').run(row.doc_no);
-    db.prepare('DELETE FROM main_cash WHERE invoice_no = ?').run(jobNo);
+    db.prepare('UPDATE main_cash SET deleted = 1 WHERE invoice_no = ? AND deleted = 0').run(jobNo);
   });
   cancel();
   biz.audit(req.user.username, 'CASHIER', jobNo, 'Cancel finalize');
@@ -593,7 +611,12 @@ app.get('/api/calls', auth, permit('calls'), (req, res) => {
   res.json(rows);
 });
 
-app.post('/api/calls', auth, permit('calls'), (req, res) => {
+app.delete('/api/calls/:id', auth, permit('calls:delete'), (req, res) => {
+  db.prepare('UPDATE call_log SET deleted = 1 WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/calls', auth, permit('calls:create'), (req, res) => {
   const contact = String(req.body.contactNo || '').trim();
   const reason = String(req.body.reason || '').trim();
   if (!contact || !reason) return res.status(400).json({ error: 'Contact number and comments are required' });
@@ -609,7 +632,12 @@ app.get('/api/assignments', auth, permit('assign'), (_req, res) => {
   res.json(db.prepare('SELECT * FROM mobile_assignments ORDER BY user_name, mobile_no').all());
 });
 
-app.post('/api/assignments', auth, permit('assign'), (req, res) => {
+app.delete('/api/assignments/:id', auth, permit('assign:delete'), (req, res) => {
+  db.prepare('UPDATE mobile_assignments SET deleted = 1 WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/assignments', auth, permit('assign:create'), (req, res) => {
   const userName = String(req.body.userName || '').trim();
   const mobileNo = String(req.body.mobileNo || '').trim();
   if (!userName || !mobileNo) return res.status(400).json({ error: 'User and mobile number are required' });
@@ -619,10 +647,10 @@ app.post('/api/assignments', auth, permit('assign'), (req, res) => {
   res.json({ id: info.lastInsertRowid });
 });
 
-app.post('/api/assignments/replace', auth, permit('assign'), (req, res) => {
+app.post('/api/assignments/replace', auth, permit('assign:update'), (req, res) => {
   const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
   const save = db.transaction(() => {
-    db.prepare('DELETE FROM mobile_assignments').run();
+    db.prepare('UPDATE mobile_assignments SET deleted = 1 WHERE deleted = 0').run();
     const insert = db.prepare('INSERT INTO mobile_assignments (date, user_name, mobile_no) VALUES (?, ?, ?)');
     for (const row of rows) {
       if (row.userName && row.mobileNo) insert.run(today(), row.userName, row.mobileNo);
@@ -632,11 +660,11 @@ app.post('/api/assignments/replace', auth, permit('assign'), (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/assignments/transfer', auth, permit('assign'), (req, res) => {
+app.post('/api/assignments/transfer', auth, permit('assign:update'), (req, res) => {
   const fromUser = String(req.body.fromUser || '').trim();
   const toUser = String(req.body.toUser || '').trim();
   if (!fromUser || !toUser) return res.status(400).json({ error: 'Choose both agents' });
-  db.prepare('UPDATE mobile_assignments SET user_name = ? WHERE user_name = ?').run(toUser, fromUser);
+  db.prepare('UPDATE mobile_assignments SET user_name = ? WHERE user_name = ? AND deleted = 0').run(toUser, fromUser);
   res.json({ ok: true });
 });
 
@@ -675,7 +703,7 @@ app.get('/api/approvals/:jobNo', auth, permit('approvals'), (req, res) => {
   res.json({ finalized: row, header, items, images });
 });
 
-app.post('/api/approvals/:jobNo/approve', auth, permit('approvals'), (req, res) => {
+app.post('/api/approvals/:jobNo/approve', auth, permit('approvals:update'), (req, res) => {
   if (!approvalGuard(req, res)) return;
   const info = db.prepare(
     'UPDATE finalized SET approved = 1, permission_granted = 1 WHERE job_no = ?'
@@ -724,7 +752,7 @@ app.get('/api/commission', auth, permit('commission'), (_req, res) => {
   });
 });
 
-app.put('/api/commission', auth, permit('commission'), (req, res) => {
+app.put('/api/commission', auth, permit('commission:update'), (req, res) => {
   if (req.body.businessCommission !== undefined) biz.setSetting('business_commission', num(req.body.businessCommission));
   if (req.body.riderCommission !== undefined) biz.setSetting('rider_commission', num(req.body.riderCommission));
   res.json({
@@ -737,7 +765,12 @@ app.get('/api/access-codes', auth, permit('access'), (_req, res) => {
   res.json(db.prepare('SELECT id, code, date, created_by FROM daily_codes ORDER BY date DESC LIMIT 60').all());
 });
 
-app.post('/api/access-codes', auth, permit('access'), (req, res) => {
+app.delete('/api/access-codes/:id', auth, permit('access:delete'), (req, res) => {
+  db.prepare('UPDATE daily_codes SET deleted = 1 WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/access-codes', auth, permit('access:create'), (req, res) => {
   const date = req.body.date || today();
   let code = String(req.body.code || '').replace(/\s/g, '');
   if (code.length >= 3 && !code.includes('#')) code = `${code.slice(0, 3)}#${code.slice(3)}`;
@@ -818,6 +851,7 @@ app.get('/api/reports/chart', auth, permit('reports'), (req, res) => {
      FROM accounts a
      LEFT JOIN account_groups g ON g.code = a.group_code
      LEFT JOIN account_subtypes s ON s.code = a.subtype_code
+     WHERE a.deleted = 0
      ORDER BY a.code`
   ).all());
 });
@@ -841,7 +875,13 @@ app.get('/api/users', auth, permit('users'), (_req, res) => {
   ).all());
 });
 
-app.post('/api/users', auth, permit('users'), asyncRoute((req, res) => {
+app.delete('/api/users/:id', auth, permit('users:delete'), (req, res) => {
+  if (String(req.user.id) === String(req.params.id)) return res.status(400).json({ error: 'You cannot remove your own login' });
+  db.prepare('UPDATE users SET deleted = 1, active = 0 WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/users', auth, permit('users:create'), asyncRoute((req, res) => {
   const username = String(req.body.username || '').trim();
   const password = String(req.body.password || '');
   const group = String(req.body.group || '').trim();
@@ -865,12 +905,18 @@ app.get('/api/accounts', auth, permit('accounts'), (_req, res) => {
        FROM accounts a
        LEFT JOIN account_groups g ON g.code = a.group_code
        LEFT JOIN account_subtypes s ON s.code = a.subtype_code
+       WHERE a.deleted = 0
        ORDER BY a.code`
     ).all(),
   });
 });
 
-app.post('/api/accounts', auth, permit('accounts'), (req, res) => {
+app.delete('/api/accounts/:code', auth, permit('accounts:delete'), (req, res) => {
+  db.prepare('UPDATE accounts SET deleted = 1 WHERE code = ?').run(req.params.code);
+  res.json({ ok: true });
+});
+
+app.post('/api/accounts', auth, permit('accounts:create'), (req, res) => {
   const name = String(req.body.name || '').trim();
   const groupCode = String(req.body.groupCode || '').trim();
   const subtypeCode = String(req.body.subtypeCode || '').trim();
@@ -889,7 +935,7 @@ app.post('/api/accounts', auth, permit('accounts'), (req, res) => {
   res.json({ code });
 });
 
-app.put('/api/accounts/:code', auth, permit('accounts'), (req, res) => {
+app.put('/api/accounts/:code', auth, permit('accounts:update'), (req, res) => {
   db.prepare('UPDATE accounts SET name = ?, payable_acc = COALESCE(?, payable_acc) WHERE code = ?').run(
     String(req.body.name || '').trim(),
     req.body.payableAcc,
@@ -898,7 +944,7 @@ app.put('/api/accounts/:code', auth, permit('accounts'), (req, res) => {
   res.json({ ok: true });
 });
 
-app.put('/api/accounts/settings/map', auth, permit('accounts'), (req, res) => {
+app.put('/api/accounts/settings/map', auth, permit('accounts:update'), (req, res) => {
   const role = String(req.body.settings || '').trim();
   const code = String(req.body.code || '').trim();
   if (!role || !code) return res.status(400).json({ error: 'Choose a role and an account' });
@@ -920,7 +966,12 @@ app.get('/api/journal', auth, permit('accounts'), (req, res) => {
   res.json(db.prepare('SELECT * FROM journal WHERE gl_no = ? ORDER BY id').all(glNo));
 });
 
-app.post('/api/journal', auth, permit('accounts'), (req, res) => {
+app.delete('/api/journal/:id', auth, permit('accounts:delete'), (req, res) => {
+  db.prepare('UPDATE journal SET deleted = 1 WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/journal', auth, permit('accounts:create'), (req, res) => {
   const lines = Array.isArray(req.body.lines) ? req.body.lines : [];
   if (!lines.length) return res.status(400).json({ error: 'Add at least one journal line' });
   const date = req.body.date || today();
@@ -951,7 +1002,13 @@ app.post('/api/journal', auth, permit('accounts'), (req, res) => {
   res.json({ glNo });
 });
 
-app.post('/api/cash/transfer', auth, permit('transfer'), (req, res) => {
+app.delete('/api/cash/:book/:id', auth, permit('transfer:delete', 'expenses:delete'), (req, res) => {
+  const table = req.params.book === 'petty' ? 'petty_cash' : 'main_cash';
+  db.prepare(`UPDATE ${table} SET deleted = 1 WHERE id = ?`).run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/cash/transfer', auth, permit('transfer:create'), (req, res) => {
   const from = String(req.body.from || '');
   const to = String(req.body.to || '');
   const amount = num(req.body.amount);
@@ -976,11 +1033,11 @@ app.get('/api/cash/petty', auth, permit('expenses'), (req, res) => {
   res.json(db.prepare('SELECT * FROM petty_cash WHERE date = ? ORDER BY id').all(date));
 });
 
-app.post('/api/cash/petty', auth, permit('expenses'), (req, res) => {
+app.post('/api/cash/petty', auth, permit('expenses:create'), (req, res) => {
   const date = req.body.date || today();
   const lines = Array.isArray(req.body.lines) ? req.body.lines : [];
   const save = db.transaction(() => {
-    db.prepare('DELETE FROM petty_cash WHERE date = ? AND description = ?').run(date, 'Expenses');
+    db.prepare('UPDATE petty_cash SET deleted = 1 WHERE date = ? AND description = ? AND deleted = 0').run(date, 'Expenses');
     for (const line of lines) {
       const amount = num(line.amount);
       if (amount <= 0) continue;
@@ -991,7 +1048,13 @@ app.post('/api/cash/petty', auth, permit('expenses'), (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/notes/debit', auth, permit('accounts'), (req, res) => {
+app.delete('/api/notes/:kind/:id', auth, permit('accounts:delete'), (req, res) => {
+  const table = req.params.kind === 'credit' ? 'credit_notes' : 'debit_notes';
+  db.prepare(`UPDATE ${table} SET deleted = 1 WHERE id = ?`).run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/notes/debit', auth, permit('accounts:create'), (req, res) => {
   const amount = num(req.body.amount);
   const date = req.body.date || today();
   if (!req.body.supplierAcc || !req.body.expenseAcc) return res.status(400).json({ error: 'Choose both accounts' });
@@ -1023,7 +1086,7 @@ app.post('/api/notes/debit', auth, permit('accounts'), (req, res) => {
   res.json({ noteNo: number, vat, expenseAmount });
 });
 
-app.post('/api/notes/credit', auth, permit('accounts'), (req, res) => {
+app.post('/api/notes/credit', auth, permit('accounts:create'), (req, res) => {
   const amount = num(req.body.amount);
   const date = req.body.date || today();
   if (!req.body.supplierAcc || !req.body.expenseAcc) return res.status(400).json({ error: 'Choose both accounts' });

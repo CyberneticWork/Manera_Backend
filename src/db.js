@@ -20,7 +20,24 @@ const connection = mysql.createConnection({
   bigNumberStrings: false,
 });
 
+const SOFT_DELETE = new Set([
+  'lookups', 'client_header', 'client_items', 'call_log', 'mobile_assignments', 'users',
+  'accounts', 'journal', 'debit_notes', 'credit_notes', 'main_cash', 'petty_cash', 'daily_codes', 'finalized',
+]);
+
+function guardSelect(sql) {
+  if (!/^\s*select\b/i.test(sql) || /\bdeleted\b/i.test(sql) || /\bjoin\b/i.test(sql)) return sql;
+  const match = sql.match(/\bfrom\s+`?([a-z_]+)`?/i);
+  if (!match || !SOFT_DELETE.has(match[1])) return sql;
+  if (/\bwhere\b/i.test(sql)) return sql.replace(/\bwhere\b/i, 'WHERE deleted = 0 AND');
+  if (/\border\s+by\b/i.test(sql)) return sql.replace(/\border\s+by\b/i, 'WHERE deleted = 0 ORDER BY');
+  if (/\bgroup\s+by\b/i.test(sql)) return sql.replace(/\bgroup\s+by\b/i, 'WHERE deleted = 0 GROUP BY');
+  if (/\blimit\b/i.test(sql)) return sql.replace(/\blimit\b/i, 'WHERE deleted = 0 LIMIT');
+  return `${sql} WHERE deleted = 0`;
+}
+
 function query(sql, params = []) {
+  sql = guardSelect(sql);
   let done = false;
   let rows;
   let error;
@@ -113,8 +130,19 @@ function ensureOpening(date) {
   return db.prepare('SELECT * FROM opening_balances WHERE date = ?').get(date);
 }
 
+function ensureDeletedColumn() {
+  for (const table of SOFT_DELETE) {
+    try {
+      query(`ALTER TABLE \`${table}\` ADD COLUMN deleted INT NOT NULL DEFAULT 0`);
+    } catch (error) {
+      if (error && (error.code === 'ER_DUP_FIELDNAME' || error.code === 'ER_NO_SUCH_TABLE')) continue;
+      throw error;
+    }
+  }
+}
+
 function seed() {
-  const count = db.prepare('SELECT COUNT(*) AS c FROM users').get().c;
+  const count = db.prepare('SELECT COUNT(*) AS c FROM users WHERE deleted >= 0').get().c;
   if (Number(count) > 0) return;
 
   const insertUser = db.prepare(
@@ -239,6 +267,7 @@ function seed() {
 }
 
 try {
+  ensureDeletedColumn();
   seed();
 } catch (error) {
   if (error && error.code === 'ER_NO_SUCH_TABLE') {

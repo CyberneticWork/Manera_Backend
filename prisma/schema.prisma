@@ -17,6 +17,7 @@ model User {
   company      String? @db.VarChar(120)
   stationId    String? @map("station_id") @db.VarChar(120)
   maxDisc      Float  @default(0) @map("max_disc")
+  deleted      Int    @default(0)
 
   @@map("users")
 }
@@ -26,6 +27,7 @@ model Lookup {
   type        String  @db.VarChar(40)
   description String  @db.VarChar(200)
   category    String? @db.VarChar(80)
+  deleted     Int     @default(0)
 
   @@map("lookups")
 }
@@ -52,6 +54,7 @@ model ClientHeader {
   totalAmount      Float   @default(0) @map("total_amount")
   status           Int     @default(0)
   createdBy        String? @map("created_by") @db.VarChar(80)
+  deleted          Int     @default(0)
 
   @@map("client_header")
 }
@@ -93,6 +96,7 @@ model ClientItem {
   weight      Float   @default(0)
   rate        String? @db.VarChar(40)
   description String? @db.VarChar(300)
+  deleted     Int     @default(0)
 
   @@map("client_items")
 }
@@ -146,6 +150,7 @@ model Finalized {
   docNo              String? @map("doc_no") @db.VarChar(40)
   approved           Int     @default(0)
   permissionGranted  Int     @default(0) @map("permission_granted")
+  deleted            Int     @default(0)
 
   @@map("finalized")
 }
@@ -159,6 +164,7 @@ model CallLog {
   agentNo   String? @map("agent_no") @db.VarChar(40)
   status    Int?
   callTime  String? @map("call_time") @db.VarChar(20)
+  deleted   Int     @default(0)
 
   @@map("call_log")
 }
@@ -168,6 +174,7 @@ model MobileAssignment {
   date     String? @db.VarChar(20)
   userName String? @map("user_name") @db.VarChar(80)
   mobileNo String? @map("mobile_no") @db.VarChar(40)
+  deleted  Int     @default(0)
 
   @@map("mobile_assignments")
 }
@@ -177,6 +184,7 @@ model DailyCode {
   code      String @db.VarChar(40)
   date      String @unique @db.VarChar(20)
   createdBy String? @map("created_by") @db.VarChar(80)
+  deleted   Int     @default(0)
 
   @@map("daily_codes")
 }
@@ -197,6 +205,7 @@ model MainCash {
   credit      Float   @default(0)
   remarks     String? @db.VarChar(300)
   month       String? @db.VarChar(20)
+  deleted     Int     @default(0)
 
   @@map("main_cash")
 }
@@ -210,6 +219,7 @@ model PettyCash {
   credit      Float   @default(0)
   remarks     String? @db.VarChar(300)
   month       String? @db.VarChar(20)
+  deleted     Int     @default(0)
 
   @@map("petty_cash")
 }
@@ -252,6 +262,7 @@ model Account {
   bankName      String? @map("bank_name") @db.VarChar(120)
   bankAccount   String? @map("bank_account") @db.VarChar(80)
   company       String? @db.VarChar(120)
+  deleted       Int     @default(0)
 
   @@map("accounts")
 }
@@ -269,6 +280,7 @@ model Journal {
   accNo       String? @map("acc_no") @db.VarChar(20)
   docNo       String? @map("doc_no") @db.VarChar(40)
   accountName String? @map("account_name") @db.VarChar(160)
+  deleted     Int     @default(0)
 
   @@map("journal")
 }
@@ -286,6 +298,7 @@ model DebitNote {
   taxType   String? @map("tax_type") @db.VarChar(20)
   userName  String? @map("user_name") @db.VarChar(80)
   remarks   String? @db.VarChar(300)
+  deleted   Int     @default(0)
 
   @@map("debit_notes")
 }
@@ -301,6 +314,7 @@ model CreditNote {
   setoffInv String? @map("setoff_inv") @db.VarChar(40)
   userName  String? @map("user_name") @db.VarChar(80)
   remarks   String? @db.VarChar(300)
+  deleted   Int     @default(0)
 
   @@map("credit_notes")
 }

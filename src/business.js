@@ -30,7 +30,7 @@ function agentCommission(weight, jobType, current) {
 }
 
 function nextDocNo() {
-  const row = db.prepare('SELECT MAX(code) AS maxCode FROM client_header').get();
+  const row = db.prepare('SELECT MAX(code) AS maxCode FROM client_header WHERE deleted >= 0').get();
   const code = (row && row.maxCode != null ? Number(row.maxCode) : 0) + 1;
   return { docNo: String(code), code };
 }
@@ -38,7 +38,7 @@ function nextDocNo() {
 function nextJobNo(dateStr) {
   const [y, m, d] = dateStr.split('-');
   const ymd = `${y}${m}${d}`;
-  const row = db.prepare('SELECT MAX(code) AS maxCode FROM finalized WHERE finalized_date = ?').get(dateStr);
+  const row = db.prepare('SELECT MAX(code) AS maxCode FROM finalized WHERE deleted >= 0 AND finalized_date = ?').get(dateStr);
   if (!row || row.maxCode == null) {
     return { jobNo: `${ymd}01`, code: 1 };
   }
@@ -66,7 +66,7 @@ function setSetting(key, value) {
 
 function itemTotals(docNo) {
   const row = db.prepare(
-    'SELECT COUNT(*) AS itemCount, COALESCE(SUM(weight), 0) AS totalWeight FROM client_items WHERE doc_no = ?'
+    'SELECT COUNT(*) AS itemCount, COALESCE(SUM(weight), 0) AS totalWeight FROM client_items WHERE deleted = 0 AND doc_no = ?'
   ).get(docNo);
   return {
     itemCount: row.itemCount || 0,

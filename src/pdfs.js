@@ -159,10 +159,36 @@ function jobQuery(jobNo, from, to) {
   if (jobNo) {
     const key = String(jobNo).trim();
     return db.prepare(
-      `${sql} WHERE f.job_no = ? OR f.doc_no = ? OR CAST(f.code AS CHAR) = ?`
-    ).all(key, key, key);
+      `${sql} WHERE f.deleted = 0 AND (h.doc_no IS NULL OR h.deleted = 0) AND (f.job_no = ? OR f.doc_no = ? OR CAST(f.code AS CHAR) = ? OR h.job_note_no = ?)`
+    ).all(key, key, key, key);
   }
-  return db.prepare(`${sql} WHERE f.finalized_date >= ? AND f.finalized_date <= ? ORDER BY f.finalized_date, f.job_no`).all(from, to);
+  return db.prepare(`${sql} WHERE f.deleted = 0 AND (h.doc_no IS NULL OR h.deleted = 0) AND f.finalized_date >= ? AND f.finalized_date <= ? ORDER BY f.finalized_date, f.job_no`).all(from, to);
+}
+
+function notFinalizedNote(jobNo, from, to) {
+  if (jobNo) {
+    const row = db.prepare(
+      `SELECT doc_no, job_note_no, date, status, reject
+       FROM client_header
+       WHERE doc_no = ? OR job_note_no = ? OR CAST(code AS CHAR) = ?
+       ORDER BY date DESC LIMIT 1`
+    ).get(jobNo, jobNo, jobNo);
+    if (!row) return '';
+    const label = row.job_note_no || row.doc_no;
+    if (row.reject) return ` Client job ${label} was rejected, so it was not bought.`;
+    if (Number(row.status) !== 1) {
+      return ` Client job ${label} is on ${pretty(row.date)} but the cashier has not finalized it yet. Bought products only include paid jobs.`;
+    }
+    return '';
+  }
+  const waiting = db.prepare(
+    `SELECT job_note_no, doc_no FROM client_header
+     WHERE status = 0 AND reject = 0 AND date >= ? AND date <= ?
+     ORDER BY doc_no`
+  ).all(from, to);
+  if (!waiting.length) return '';
+  const names = waiting.map((row) => row.job_note_no || row.doc_no).join(', ');
+  return ` These client jobs are on the dates but are still waiting for the cashier: ${names}.`;
 }
 
 function bundle(row) {
@@ -391,7 +417,7 @@ async function build(type, query) {
       if (!jobs.length) {
         banner(doc, title, `${source}    ${pretty(from)} to ${pretty(to)}`);
         doc.font('Helvetica').fontSize(11).fillColor('#1c1408')
-          .text(jobNo ? `No bought product was found for job ${jobNo}.` : 'No bought products were finalized in this date range.');
+          .text((jobNo ? `No bought product was found for job ${jobNo}.` : 'No bought products were finalized in this date range.') + notFinalizedNote(jobNo, from, to));
         return;
       }
       jobs.forEach((packed) => {
@@ -463,6 +489,7 @@ async function build(type, query) {
        FROM accounts a
        LEFT JOIN account_groups g ON g.code = a.group_code
        LEFT JOIN account_subtypes s ON s.code = a.subtype_code
+       WHERE a.deleted = 0
        ORDER BY a.code`
     ).all();
     return render((doc) => {
@@ -545,6 +572,7 @@ function collect(type, query) {
         ? `No bought product for ${jobNo}.`
         : `No bought products were finalized from ${pretty(from)} to ${pretty(to)}.`;
       if (onTheseDates.length) empty += ` Jobs in these dates: ${onTheseDates.join(', ')}.`;
+      empty += notFinalizedNote(jobNo, from, to);
     }
     return {
       title,
@@ -700,6 +728,7 @@ function collect(type, query) {
        FROM accounts a
        LEFT JOIN account_groups g ON g.code = a.group_code
        LEFT JOIN account_subtypes s ON s.code = a.subtype_code
+       WHERE a.deleted = 0
        ORDER BY a.code`
     ).all();
     return {
