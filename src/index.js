@@ -171,6 +171,15 @@ function riderOwns(user, header) {
   return names.includes(String(header?.rider_name || '').trim().toLowerCase());
 }
 
+function riderChoice(user) {
+  if (!user || user.group !== 'Rider') return null;
+  const title = String(user.title || '').trim();
+  const username = String(user.username || '').trim();
+  const rows = db.prepare("SELECT description FROM lookups WHERE type = 'rider'").all();
+  const match = (value) => rows.find((row) => String(row.description || '').trim().toLowerCase() === value.toLowerCase());
+  return (title && match(title)?.description) || (username && match(username)?.description) || title || username || '';
+}
+
 function asNumber(value) {
   return Number(value) || 0;
 }
@@ -365,6 +374,11 @@ app.get('/api/dashboard', auth, (req, res) => {
        FROM client_header WHERE status = 0 AND reject = 0${ownSql}
        ORDER BY date DESC, doc_no DESC LIMIT 6`
     ).all(...own),
+    arrivals: db.prepare(
+      `SELECT doc_no, code, name, nic, job_type, location, total_amount, rider_name, mobile_no, created_by, date
+       FROM client_header WHERE status = 0 AND reject = 0${ownSql}
+       ORDER BY code DESC LIMIT 8`
+    ).all(...own),
     role: req.user.group,
   });
 });
@@ -467,7 +481,7 @@ app.post('/api/clients', auth, permit('clients:create'), asyncRoute((req, res) =
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 0, ?)`
     ).run(
       docNo, code, body.nic || '', body.name, body.address || '', body.mobileNo, body.location || '',
-      body.agentName || '', num(body.agentCommission), body.riderName || '', num(body.riderCommission),
+      body.agentName || '', num(body.agentCommission), riderChoice(req.user) || body.riderName || '', num(body.riderCommission),
       body.jobType || '', body.jobNoteNo || '', date, body.note || '', body.buddy || '', body.answered || '',
       num(body.totalAmount), req.user.username
     );
@@ -487,8 +501,10 @@ app.put('/api/clients/:docNo', auth, permit('clients:update', 'cashier:update'),
   if (existing.status === 1 && req.user.group !== 'SAdmin') {
     return res.status(400).json({ error: 'This job is already finalized' });
   }
+  if (!riderOwns(req.user, existing)) return res.status(404).json({ error: 'Job not found' });
   const body = req.body || {};
   const date = body.date || existing.date;
+  const riderName = riderChoice(req.user) || (body.riderName ?? existing.rider_name);
   const save = db.transaction(() => {
     db.prepare(
       `UPDATE client_header SET nic = ?, name = ?, address = ?, mobile_no = ?, location = ?,
@@ -503,7 +519,7 @@ app.put('/api/clients/:docNo', auth, permit('clients:update', 'cashier:update'),
       body.location ?? existing.location,
       body.agentName ?? existing.agent_name,
       body.agentCommission !== undefined ? num(body.agentCommission) : existing.agent_commission,
-      body.riderName ?? existing.rider_name,
+      riderName,
       body.riderCommission !== undefined ? num(body.riderCommission) : existing.rider_commission,
       body.jobType ?? existing.job_type,
       body.jobNoteNo ?? existing.job_note_no,
