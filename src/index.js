@@ -8,7 +8,7 @@ const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const storage = require('./storage');
 const acl = require('./acl');
-const { db, today, ensureOpening } = require('./db');
+const { db, today, addDays, ensureOpening } = require('./db');
 const biz = require('./business');
 const { build: buildPdf, collect: collectReport } = require('./pdfs');
 
@@ -171,52 +171,200 @@ function riderOwns(user, header) {
   return names.includes(String(header?.rider_name || '').trim().toLowerCase());
 }
 
+function asNumber(value) {
+  return Number(value) || 0;
+}
+
+function weekday(dateStr) {
+  return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new Date(`${dateStr}T00:00:00`).getDay()];
+}
+
 app.get('/api/dashboard', auth, (req, res) => {
   const date = today();
   const month = date.slice(0, 7);
+  const weekStart = addDays(date, -6);
   const names = riderNames(req.user);
-  const riderSql = names ? ` AND LOWER(TRIM(rider_name)) IN (${names.map(() => '?').join(', ') || 'NULL'})` : '';
-  const pending = db.prepare(`SELECT COUNT(*) AS c FROM client_header WHERE status = 0 AND reject = 0${riderSql}`).get(...(names || [])).c;
-  const finalizedToday = db.prepare('SELECT COUNT(*) AS c FROM finalized WHERE finalized_date = ?').get(date).c;
-  const unapproved = db.prepare('SELECT COUNT(*) AS c FROM finalized WHERE approved = 0').get().c;
-  const cash = db.prepare(
-    'SELECT COALESCE(SUM(debit), 0) AS debit, COALESCE(SUM(credit), 0) AS credit FROM main_cash WHERE date = ?'
-  ).get(date);
-  const todayJobs = db.prepare(
-    `SELECT COUNT(*) AS jobs, COALESCE(SUM(amount), 0) AS amount, COALESCE(SUM(total_weight), 0) AS weight
-     FROM finalized WHERE finalized_date = ?`
-  ).get(date);
-  const monthJobs = db.prepare(
-    `SELECT COUNT(*) AS jobs, COALESCE(SUM(amount), 0) AS amount
-     FROM finalized WHERE finalized_date LIKE ?`
-  ).get(`${month}%`);
-  const byType = db.prepare(
-    `SELECT job_type, COUNT(*) AS jobs, COALESCE(SUM(amount), 0) AS amount
-     FROM finalized WHERE finalized_date = ? GROUP BY job_type`
-  ).all(date);
-  const callsToday = db.prepare('SELECT COUNT(*) AS c FROM call_log WHERE date = ?').get(date).c;
+  const ownSql = names ? ` AND LOWER(TRIM(rider_name)) IN (${names.map(() => '?').join(', ')})` : '';
+  const own = names || [];
+  const shop = !names;
+
+  const countOf = (sql, params = []) => asNumber(db.prepare(sql).get(...params)?.c);
+  const rowOf = (sql, params = []) => db.prepare(sql).get(...params) || {};
+  const slices = (sql, params = []) => db.prepare(sql).all(...params).map((row) => ({
+    label: row.label || 'Other',
+    jobs: asNumber(row.jobs),
+    amount: asNumber(row.amount),
+    weight: asNumber(row.weight),
+  }));
+
+  const pending = countOf(
+    `SELECT COUNT(*) AS c FROM client_header WHERE status = 0 AND reject = 0${ownSql}`,
+    own
+  );
+  const pendingAmount = asNumber(rowOf(
+    `SELECT COALESCE(SUM(total_amount), 0) AS amount FROM client_header WHERE status = 0 AND reject = 0${ownSql}`,
+    own
+  ).amount);
+  const rejected = countOf(`SELECT COUNT(*) AS c FROM client_header WHERE reject = 1${ownSql}`, own);
+  const finalizedToday = countOf(
+    `SELECT COUNT(*) AS c FROM finalized WHERE finalized_date = ?${ownSql}`,
+    [date, ...own]
+  );
+  const unapproved = countOf(`SELECT COUNT(*) AS c FROM finalized WHERE approved = 0${ownSql}`, own);
+  const approved = countOf(`SELECT COUNT(*) AS c FROM finalized WHERE approved = 1${ownSql}`, own);
+
+  const cash = shop
+    ? rowOf('SELECT COALESCE(SUM(debit), 0) AS debit, COALESCE(SUM(credit), 0) AS credit FROM main_cash WHERE date = ?', [date])
+    : { debit: 0, credit: 0 };
+  const petty = shop
+    ? rowOf('SELECT COALESCE(SUM(debit), 0) AS debit, COALESCE(SUM(credit), 0) AS credit FROM petty_cash WHERE date = ?', [date])
+    : { debit: 0, credit: 0 };
+  const todayJobs = rowOf(
+    `SELECT COUNT(*) AS jobs, COALESCE(SUM(amount), 0) AS amount, COALESCE(SUM(total_weight), 0) AS weight,
+            COALESCE(SUM(agent_commission), 0) AS agent_commission, COALESCE(SUM(rider_commission), 0) AS rider_commission,
+            COALESCE(SUM(item_count), 0) AS items
+     FROM finalized WHERE finalized_date = ?${ownSql}`,
+    [date, ...own]
+  );
+  const monthJobs = rowOf(
+    `SELECT COUNT(*) AS jobs, COALESCE(SUM(amount), 0) AS amount, COALESCE(SUM(total_weight), 0) AS weight,
+            COALESCE(SUM(agent_commission), 0) AS agent_commission, COALESCE(SUM(rider_commission), 0) AS rider_commission
+     FROM finalized WHERE finalized_date LIKE ?${ownSql}`,
+    [`${month}%`, ...own]
+  );
+  const callsToday = shop ? countOf('SELECT COUNT(*) AS c FROM call_log WHERE date = ?', [date]) : 0;
+  const callsMonth = shop ? countOf('SELECT COUNT(*) AS c FROM call_log WHERE date LIKE ?', [`${month}%`]) : 0;
+
+  const typesToday = slices(
+    `SELECT COALESCE(NULLIF(TRIM(job_type), ''), 'Other') AS label, COUNT(*) AS jobs,
+            COALESCE(SUM(amount), 0) AS amount, COALESCE(SUM(total_weight), 0) AS weight
+     FROM finalized WHERE finalized_date = ?${ownSql}
+     GROUP BY COALESCE(NULLIF(TRIM(job_type), ''), 'Other')
+     ORDER BY amount DESC`,
+    [date, ...own]
+  );
+  const typesMonth = slices(
+    `SELECT COALESCE(NULLIF(TRIM(job_type), ''), 'Other') AS label, COUNT(*) AS jobs,
+            COALESCE(SUM(amount), 0) AS amount, COALESCE(SUM(total_weight), 0) AS weight
+     FROM finalized WHERE finalized_date LIKE ?${ownSql}
+     GROUP BY COALESCE(NULLIF(TRIM(job_type), ''), 'Other')
+     ORDER BY amount DESC`,
+    [`${month}%`, ...own]
+  );
+  const openTypes = slices(
+    `SELECT COALESCE(NULLIF(TRIM(job_type), ''), 'Other') AS label, COUNT(*) AS jobs,
+            COALESCE(SUM(total_amount), 0) AS amount, 0 AS weight
+     FROM client_header WHERE status = 0 AND reject = 0${ownSql}
+     GROUP BY COALESCE(NULLIF(TRIM(job_type), ''), 'Other')
+     ORDER BY amount DESC`,
+    own
+  );
+  const weekRows = db.prepare(
+    `SELECT finalized_date AS date, COUNT(*) AS jobs, COALESCE(SUM(amount), 0) AS amount,
+            COALESCE(SUM(total_weight), 0) AS weight
+     FROM finalized WHERE finalized_date >= ? AND finalized_date <= ?${ownSql}
+     GROUP BY finalized_date`
+  ).all(weekStart, date, ...own);
+  const weekByDate = new Map(weekRows.map((row) => [String(row.date).slice(0, 10), row]));
+  const week = [];
+  for (let offset = 0; offset < 7; offset += 1) {
+    const day = addDays(weekStart, offset);
+    const row = weekByDate.get(day) || {};
+    week.push({
+      date: day,
+      label: weekday(day),
+      jobs: asNumber(row.jobs),
+      amount: asNumber(row.amount),
+      weight: asNumber(row.weight),
+    });
+  }
+  const places = slices(
+    `SELECT COALESCE(NULLIF(TRIM(location), ''), 'Unknown') AS label, COUNT(*) AS jobs,
+            COALESCE(SUM(amount), 0) AS amount, COALESCE(SUM(total_weight), 0) AS weight
+     FROM finalized WHERE finalized_date LIKE ?${ownSql}
+     GROUP BY COALESCE(NULLIF(TRIM(location), ''), 'Unknown')
+     ORDER BY amount DESC LIMIT 6`,
+    [`${month}%`, ...own]
+  );
+  const openPlaces = slices(
+    `SELECT COALESCE(NULLIF(TRIM(location), ''), 'Unknown') AS label, COUNT(*) AS jobs,
+            COALESCE(SUM(total_amount), 0) AS amount, 0 AS weight
+     FROM client_header WHERE status = 0 AND reject = 0${ownSql}
+     GROUP BY COALESCE(NULLIF(TRIM(location), ''), 'Unknown')
+     ORDER BY amount DESC LIMIT 6`,
+    own
+  );
+  const agents = slices(
+    `SELECT COALESCE(NULLIF(TRIM(agent_name), ''), 'Unassigned') AS label, COUNT(*) AS jobs,
+            COALESCE(SUM(amount), 0) AS amount, COALESCE(SUM(total_weight), 0) AS weight
+     FROM finalized WHERE finalized_date LIKE ?${ownSql}
+     GROUP BY COALESCE(NULLIF(TRIM(agent_name), ''), 'Unassigned')
+     ORDER BY amount DESC LIMIT 6`,
+    [`${month}%`, ...own]
+  );
+
   res.json({
     date,
+    scope: shop ? 'shop' : 'rider',
     pending,
+    pendingAmount,
+    rejected,
+    approved,
     finalizedToday,
     unapproved,
-    cashDebit: cash.debit,
-    cashCredit: cash.credit,
-    weightToday: todayJobs.weight,
-    amountToday: todayJobs.amount,
-    monthJobs: monthJobs.jobs,
-    monthAmount: monthJobs.amount,
+    cashDebit: asNumber(cash.debit),
+    cashCredit: asNumber(cash.credit),
+    weightToday: asNumber(todayJobs.weight),
+    amountToday: asNumber(todayJobs.amount),
+    monthJobs: asNumber(monthJobs.jobs),
+    monthAmount: asNumber(monthJobs.amount),
+    monthWeight: asNumber(monthJobs.weight),
     callsToday,
-    byType,
+    callsMonth,
+    byType: typesToday.map((row) => ({ job_type: row.label, jobs: row.jobs, amount: row.amount })),
+    today: {
+      jobs: asNumber(todayJobs.jobs),
+      amount: asNumber(todayJobs.amount),
+      weight: asNumber(todayJobs.weight),
+      items: asNumber(todayJobs.items),
+      agentCommission: asNumber(todayJobs.agent_commission),
+      riderCommission: asNumber(todayJobs.rider_commission),
+      cashOut: asNumber(cash.debit),
+      cashIn: asNumber(cash.credit),
+      pettyOut: asNumber(petty.debit),
+      pettyIn: asNumber(petty.credit),
+      calls: callsToday,
+    },
+    month: {
+      jobs: asNumber(monthJobs.jobs),
+      amount: asNumber(monthJobs.amount),
+      weight: asNumber(monthJobs.weight),
+      agentCommission: asNumber(monthJobs.agent_commission),
+      riderCommission: asNumber(monthJobs.rider_commission),
+      calls: callsMonth,
+    },
+    book: [
+      { label: 'Pending', value: pending },
+      { label: 'Approved', value: approved },
+      { label: 'Need approval', value: unapproved },
+      { label: 'Rejected', value: rejected },
+    ],
+    typesToday,
+    typesMonth,
+    openTypes,
+    week,
+    places,
+    openPlaces,
+    agents,
     recent: db.prepare(
       `SELECT job_no, doc_no, nic, job_type, amount, location, finalized_date, approved
-       FROM finalized ORDER BY finalized_date DESC, job_no DESC LIMIT 6`
-    ).all(),
+       FROM finalized WHERE 1 = 1${ownSql} ORDER BY finalized_date DESC, job_no DESC LIMIT 6`
+    ).all(...own),
     waiting: db.prepare(
       `SELECT doc_no, name, nic, job_type, location, date, total_amount, rider_name
-       FROM client_header WHERE status = 0 AND reject = 0${riderSql}
+       FROM client_header WHERE status = 0 AND reject = 0${ownSql}
        ORDER BY date DESC, doc_no DESC LIMIT 6`
-    ).all(...(names || [])),
+    ).all(...own),
     role: req.user.group,
   });
 });
