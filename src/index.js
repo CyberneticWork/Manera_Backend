@@ -160,10 +160,23 @@ app.put('/api/firebase', auth, permit('firebase:update'), (req, res) => {
   res.json(storage.publicStatus());
 });
 
+function riderNames(user) {
+  if (!user || user.group !== 'Rider') return null;
+  return [...new Set([user.username, user.title].map((value) => String(value || '').trim().toLowerCase()).filter(Boolean))];
+}
+
+function riderOwns(user, header) {
+  const names = riderNames(user);
+  if (!names) return true;
+  return names.includes(String(header?.rider_name || '').trim().toLowerCase());
+}
+
 app.get('/api/dashboard', auth, (req, res) => {
   const date = today();
   const month = date.slice(0, 7);
-  const pending = db.prepare('SELECT COUNT(*) AS c FROM client_header WHERE status = 0 AND reject = 0').get().c;
+  const names = riderNames(req.user);
+  const riderSql = names ? ` AND LOWER(TRIM(rider_name)) IN (${names.map(() => '?').join(', ') || 'NULL'})` : '';
+  const pending = db.prepare(`SELECT COUNT(*) AS c FROM client_header WHERE status = 0 AND reject = 0${riderSql}`).get(...(names || [])).c;
   const finalizedToday = db.prepare('SELECT COUNT(*) AS c FROM finalized WHERE finalized_date = ?').get(date).c;
   const unapproved = db.prepare('SELECT COUNT(*) AS c FROM finalized WHERE approved = 0').get().c;
   const cash = db.prepare(
@@ -200,10 +213,10 @@ app.get('/api/dashboard', auth, (req, res) => {
        FROM finalized ORDER BY finalized_date DESC, job_no DESC LIMIT 6`
     ).all(),
     waiting: db.prepare(
-      `SELECT doc_no, name, nic, job_type, location, date, total_amount
-       FROM client_header WHERE status = 0 AND reject = 0
+      `SELECT doc_no, name, nic, job_type, location, date, total_amount, rider_name
+       FROM client_header WHERE status = 0 AND reject = 0${riderSql}
        ORDER BY date DESC, doc_no DESC LIMIT 6`
-    ).all(),
+    ).all(...(names || [])),
     role: req.user.group,
   });
 });
@@ -249,16 +262,18 @@ function jobPayload(row, items, images, documents) {
 
 app.get('/api/clients', auth, permit('clients', 'cashier', 'history'), (req, res) => {
   const status = req.query.status === undefined ? 0 : Number(req.query.status);
+  const names = riderNames(req.user);
+  const riderSql = names ? ` AND LOWER(TRIM(rider_name)) IN (${names.map(() => '?').join(', ') || 'NULL'})` : '';
   const rows = db.prepare(
-    `SELECT doc_no, agent_name, mobile_no, date, name, nic, location, total_amount, job_type, status, reject
-     FROM client_header WHERE status = ? AND reject = 0 ORDER BY code DESC`
-  ).all(status);
+    `SELECT doc_no, agent_name, rider_name, mobile_no, date, name, nic, location, total_amount, job_type, status, reject
+     FROM client_header WHERE status = ? AND reject = 0${riderSql} ORDER BY code DESC`
+  ).all(status, ...(names || []));
   res.json(rows);
 });
 
 app.get('/api/clients/:docNo', auth, permit('clients', 'cashier', 'history', 'approvals'), (req, res) => {
   const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
-  if (!header) return res.status(404).json({ error: 'Job not found' });
+  if (!header || !riderOwns(req.user, header)) return res.status(404).json({ error: 'Job not found' });
   const items = db.prepare('SELECT * FROM client_items WHERE doc_no = ? ORDER BY id').all(req.params.docNo);
   const images = db.prepare('SELECT * FROM client_images WHERE doc_no = ? ORDER BY id').all(req.params.docNo);
   const documents = db.prepare('SELECT * FROM client_documents WHERE doc_no = ? ORDER BY id').all(req.params.docNo);
@@ -881,10 +896,23 @@ app.delete('/api/users/:id', auth, permit('users:delete'), (req, res) => {
   res.json({ ok: true });
 });
 
+const USER_GROUPS = new Set([...acl.ROLES, 'SAdmin']);
+
+app.put('/api/users/:id', auth, permit('users:update'), (req, res) => {
+  const group = String(req.body.group || '').trim();
+  if (!USER_GROUPS.has(group)) return res.status(400).json({ error: 'Choose a valid role' });
+  const user = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  db.prepare('UPDATE users SET group_code = ? WHERE id = ?').run(group, req.params.id);
+  biz.audit(req.user.username, 'USER', req.params.id, `Assign ${group}`);
+  res.json({ ok: true, group });
+});
+
 app.post('/api/users', auth, permit('users:create'), asyncRoute((req, res) => {
   const username = String(req.body.username || '').trim();
   const password = String(req.body.password || '');
   const group = String(req.body.group || '').trim();
+  if (!USER_GROUPS.has(group)) bad('Choose a valid role');
   if (!username || !password || !group) bad('Username, password, and category are required');
   if (password.length < 4) bad('Password must be at least 4 characters');
   const exists = db.prepare('SELECT id FROM users WHERE username = ?').get(username);

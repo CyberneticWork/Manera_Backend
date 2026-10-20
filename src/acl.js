@@ -21,15 +21,16 @@ const PERMISSIONS = [
   { key: 'firebase', label: 'Firebase', group: 'Utilities' },
 ];
 
-const ROLES = ['CallCenter', 'Cashier', 'History', 'Account', 'Admin'];
+const ROLES = ['CallCenter', 'Cashier', 'History', 'Account', 'Admin', 'Rider'];
 const SCREENS = new Set(PERMISSIONS.map((item) => item.key));
 
 const DEFAULTS = {
   CallCenter: grant(['calls', 'clients', 'assign', 'masters'], ACTIONS).concat(grant(['history', 'reports'], ['view'])),
-  Cashier: grant(['cashier', 'masters'], ACTIONS).concat(grant(['history', 'reports'], ['view'])),
+  Cashier: grant(['cashier', 'masters'], ACTIONS).concat(grant(['history', 'reports', 'clients'], ['view'])),
   History: grant(['history'], ['view']),
   Account: grant(['cashier', 'accounts', 'transfer', 'expenses', 'masters'], ACTIONS).concat(grant(['history', 'reports'], ['view'])),
-  Admin: grant(['approvals', 'commission', 'access'], ACTIONS).concat(grant(['history', 'reports'], ['view'])),
+  Admin: grant(['approvals', 'commission', 'access'], ACTIONS).concat(grant(['history', 'reports', 'clients'], ['view'])),
+  Rider: grant(['clients'], ['view']),
 };
 
 function grant(screens, actions) {
@@ -59,10 +60,16 @@ function fromSaved(role, list) {
   });
 }
 
+function withClientAccess(role, list) {
+  const next = [...(list || [])];
+  if (['Admin', 'Cashier', 'Rider'].includes(role) && !next.includes('clients:view')) next.push('clients:view');
+  return [...new Set(next)];
+}
+
 function permissionsFor(group) {
   if (group === 'SAdmin') return grant([...SCREENS], ACTIONS);
   const saved = readMap();
-  return fromSaved(group, Array.isArray(saved[group]) ? saved[group] : DEFAULTS[group]);
+  return withClientAccess(group, fromSaved(group, Array.isArray(saved[group]) ? saved[group] : DEFAULTS[group]));
 }
 
 function readMap() {
@@ -80,7 +87,7 @@ function matrix() {
   const saved = readMap();
   const roles = {};
   for (const role of ROLES) {
-    roles[role] = fromSaved(role, Array.isArray(saved[role]) ? saved[role] : DEFAULTS[role]);
+    roles[role] = withClientAccess(role, fromSaved(role, Array.isArray(saved[role]) ? saved[role] : DEFAULTS[role]));
   }
   return { permissions: PERMISSIONS, actions: ACTIONS, roles, locked: ['SAdmin'] };
 }
