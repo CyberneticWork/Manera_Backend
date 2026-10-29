@@ -576,9 +576,19 @@ app.delete('/api/clients/:docNo', auth, permit('clients:delete', 'history:delete
   res.json({ ok: true });
 });
 
-app.post('/api/clients/:docNo/images', auth, permit('clients:update', 'cashier:update'), upload.single('image'), asyncRoute(async (req, res) => {
+function canUploadImages(user) {
+  if (!user) return false;
+  if (user.group === 'SAdmin') return true;
+  if (acl.can(user.group, ['clients:update', 'cashier:update'])) return true;
+  return user.group === 'Rider' && acl.can(user.group, ['clients']);
+}
+
+app.post('/api/clients/:docNo/images', auth, (req, res, next) => {
+  if (!canUploadImages(req.user)) return res.status(403).json({ error: 'Your access list does not include this action' });
+  next();
+}, upload.single('image'), asyncRoute(async (req, res) => {
   const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
-  if (!header) return res.status(404).json({ error: 'Job not found' });
+  if (!header || !riderOwns(req.user, header)) return res.status(404).json({ error: 'Job not found' });
   if (!req.file) return res.status(400).json({ error: 'Choose an image' });
   const contentType = /^image\//.test(req.file.mimetype) ? req.file.mimetype : imageContentType(req.file.originalname);
   if (!contentType) return res.status(400).json({ error: 'Choose an image file' });
