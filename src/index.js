@@ -29,6 +29,20 @@ app.use(cors({
   optionsSuccessStatus: 204,
 }));
 app.use(express.json({ limit: '4mb' }));
+app.use(express.text({ type: 'text/plain', limit: '8mb' }));
+app.use((req, _res, next) => {
+  if (typeof req.body === 'string') {
+    const text = req.body.trim();
+    if (text.startsWith('{') || text.startsWith('[')) {
+      try { req.body = JSON.parse(text); } catch { /* leave the raw text */ }
+    }
+  }
+  if (req.method === 'POST' && req.body && typeof req.body === 'object') {
+    const override = String(req.body._method || '').toUpperCase();
+    if (override === 'PUT' || override === 'PATCH' || override === 'DELETE') req.method = override;
+  }
+  next();
+});
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -46,7 +60,8 @@ function sign(user) {
 function auth(req, res, next) {
   const header = req.headers.authorization || '';
   let token = header.startsWith('Bearer ') ? header.slice(7) : '';
-  if (!token && String(req.path).startsWith('/api/media') && req.query.token) token = String(req.query.token);
+  if (!token && req.query && req.query.token) token = String(req.query.token);
+  if (!token && req.body && typeof req.body === 'object' && req.body.token) token = String(req.body.token);
   if (!token) return res.status(401).json({ error: 'Login required' });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
