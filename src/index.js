@@ -17,7 +17,17 @@ const PORT = Number(process.env.PORT || 4000);
 const HOST = process.env.HOST || '0.0.0.0';
 const JWT_SECRET = process.env.JWT_SECRET || 'goldstore-dev-secret';
 
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  next();
+});
+const corsOrigin = process.env.CORS_ORIGIN;
+app.use(cors({
+  origin: corsOrigin && corsOrigin !== '*' ? corsOrigin.split(',').map((item) => item.trim()) : true,
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+  maxAge: 86400,
+  optionsSuccessStatus: 204,
+}));
 app.use(express.json({ limit: '4mb' }));
 
 const upload = multer({
