@@ -28,8 +28,8 @@ app.use(cors({
   maxAge: 86400,
   optionsSuccessStatus: 204,
 }));
-app.use(express.json({ limit: '4mb' }));
-app.use(express.text({ type: 'text/plain', limit: '8mb' }));
+app.use(express.json({ limit: '12mb' }));
+app.use(express.text({ type: 'text/plain', limit: '12mb' }));
 app.use((req, _res, next) => {
   if (typeof req.body === 'string') {
     const text = req.body.trim();
@@ -608,27 +608,39 @@ function canUploadImages(user) {
   return user.group === 'Rider' && acl.can(user.group, ['clients']);
 }
 
-app.post('/api/clients/:docNo/images', auth, (req, res, next) => {
-  if (!canUploadImages(req.user)) return res.status(403).json({ error: 'Your access list does not include this action' });
-  next();
-}, upload.single('image'), asyncRoute(async (req, res) => {
+async function storeClientImage(req, res, buffer, contentType, originalName) {
   const header = db.prepare('SELECT * FROM client_header WHERE doc_no = ?').get(req.params.docNo);
   if (!header || !riderOwns(req.user, header)) return res.status(404).json({ error: 'Job not found' });
-  if (!req.file) return res.status(400).json({ error: 'Choose an image' });
-  const contentType = /^image\//.test(req.file.mimetype) ? req.file.mimetype : imageContentType(req.file.originalname);
-  if (!contentType) return res.status(400).json({ error: 'Choose an image file' });
+  if (!buffer || !buffer.length) return res.status(400).json({ error: 'Choose an image' });
+  const type = /^image\//.test(contentType || '') ? contentType : imageContentType(originalName);
+  if (!type) return res.status(400).json({ error: 'Choose an image file' });
   const count = db.prepare('SELECT COUNT(*) AS c FROM client_images WHERE doc_no = ?').get(req.params.docNo).c;
   const stored = await storage.uploadObject({
-    buffer: req.file.buffer,
-    contentType,
-    originalName: req.file.originalname,
+    buffer,
+    contentType: type,
+    originalName: originalName || 'photo.jpg',
     folder: `clients/${req.params.docNo}/images`,
   });
   const info = db.prepare(
     'INSERT INTO client_images (doc_no, nic, date, type, url, img_number, storage_path) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).run(req.params.docNo, header.nic, header.date, req.body.type || 'Item', stored.url, count + 1, stored.storagePath);
-  res.json({ id: info.lastInsertRowid, url: stored.url, type: req.body.type || 'Item' });
-}));
+  ).run(req.params.docNo, header.nic, header.date, (req.body && req.body.type) || 'Item', stored.url, count + 1, stored.storagePath);
+  res.json({ id: info.lastInsertRowid, url: stored.url, type: (req.body && req.body.type) || 'Item' });
+}
+
+app.post('/api/clients/:docNo/images', auth, (req, res, next) => {
+  if (!canUploadImages(req.user)) return res.status(403).json({ error: 'Your access list does not include this action' });
+  const encoded = req.body && typeof req.body === 'object' ? req.body.imageBase64 : '';
+  if (!encoded) return upload.single('image')(req, res, (err) => {
+    if (err) return next(err);
+    return storeClientImage(req, res, req.file && req.file.buffer, req.file && req.file.mimetype, req.file && req.file.originalname).catch(next);
+  });
+  const match = String(encoded).match(/^data:([^;,]+);base64,([\s\S]+)$/);
+  const contentType = (match && match[1]) || req.body.contentType || '';
+  const base64 = (match && match[2]) || String(encoded);
+  let buffer;
+  try { buffer = Buffer.from(base64, 'base64'); } catch { return res.status(400).json({ error: 'Choose an image file' }); }
+  return storeClientImage(req, res, buffer, contentType, req.body.name || 'photo.jpg').catch(next);
+});
 
 app.get('/api/media/images/:id', auth, permit('clients', 'cashier', 'history', 'approvals', 'reports'), asyncRoute(async (req, res) => {
   const image = db.prepare('SELECT * FROM client_images WHERE id = ?').get(req.params.id);
