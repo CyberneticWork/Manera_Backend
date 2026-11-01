@@ -1089,7 +1089,7 @@ app.get('/api/reports/:type/data', auth, permit('reports'), (req, res) => {
 
 app.get('/api/reports/:type/pdf', auth, permit('reports'), asyncRoute(async (req, res) => {
   if (req.params.type !== 'approve' && !requireAccess(req, res)) return;
-  const pdf = await buildPdf(req.params.type, req.query);
+  const pdf = await buildPdf(req.params.type, { ...req.query, printedBy: req.user.username });
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `inline; filename="${req.params.type}.pdf"`);
   res.send(pdf);

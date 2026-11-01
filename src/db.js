@@ -266,9 +266,19 @@ function seed() {
   ).run(today());
 }
 
+function ensureImageTypes() {
+  const names = ['License', 'JOB SHEET', 'RECIEPT', 'CUSTOMER', 'SINGLE ITEM PHOTOS', 'SINGLE SCALE PHOTO'];
+  const insert = db.prepare('INSERT INTO lookups (type, description, category) VALUES (?, ?, NULL)');
+  names.forEach((name) => {
+    const found = db.prepare('SELECT id FROM lookups WHERE type = ? AND description = ?').get('imageType', name);
+    if (!found) insert.run('imageType', name);
+  });
+}
+
 try {
   ensureDeletedColumn();
   seed();
+  ensureImageTypes();
 } catch (error) {
   if (error && error.code === 'ER_NO_SUCH_TABLE') {
     console.error('MySQL tables are missing. Run npm run db:push in the backend folder, then start again.');
