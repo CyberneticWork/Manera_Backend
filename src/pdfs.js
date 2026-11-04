@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const PDFDocument = require('pdfkit');
-const { db, ensureOpening } = require('./db');
+const { db, ensureOpening, photoTypeLabel, sortPhotos } = require('./db');
 const biz = require('./business');
 
 const uploadDir = path.join(__dirname, '..', 'uploads');
@@ -200,7 +200,8 @@ function bundle(row) {
     ? db.prepare('SELECT * FROM client_items WHERE doc_no = ? ORDER BY id').all(row.doc_no)
     : [];
   const images = row.doc_no
-    ? db.prepare('SELECT * FROM client_images WHERE doc_no = ? ORDER BY img_number, id').all(row.doc_no)
+    ? sortPhotos(db.prepare('SELECT * FROM client_images WHERE doc_no = ?').all(row.doc_no))
+      .map((image) => ({ ...image, type: photoTypeLabel(image.type) }))
     : [];
   return { row, items, images };
 }

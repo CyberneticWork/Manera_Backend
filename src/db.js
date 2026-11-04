@@ -266,12 +266,92 @@ function seed() {
   ).run(today());
 }
 
+const PHOTO_TYPES = [
+  'ID front',
+  'ID back',
+  'License',
+  'Passport',
+  'Job sheet',
+  'Receipt',
+  'Customer',
+  'Customer vehicle',
+  'All item photo',
+  'All item scale photo',
+  'Single item photo',
+  'Single scale photo',
+  'Other',
+];
+
+const PHOTO_TYPE_ALIASES = {
+  'id front': 0,
+  idfront: 0,
+  nic: 0,
+  'nic front': 0,
+  'id back': 1,
+  idback: 1,
+  license: 2,
+  passport: 3,
+  'job sheet': 4,
+  jobsheet: 4,
+  receipt: 5,
+  reciept: 5,
+  customer: 6,
+  'customer vehicle': 7,
+  customervehicle: 7,
+  'all item photo': 8,
+  'all item photos': 8,
+  'all item scale photo': 9,
+  'all item scale photos': 9,
+  'single item photo': 10,
+  'single item photos': 10,
+  'single scale photo': 11,
+  'single scale photos': 11,
+  other: 12,
+  item: 12,
+  'not assing': 12,
+  'not assign': 12,
+};
+
+function photoTypeKey(type) {
+  return String(type || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function photoTypeRank(type) {
+  const key = photoTypeKey(type);
+  if (Object.prototype.hasOwnProperty.call(PHOTO_TYPE_ALIASES, key)) return PHOTO_TYPE_ALIASES[key];
+  return PHOTO_TYPES.length;
+}
+
+function photoTypeLabel(type) {
+  const rank = photoTypeRank(type);
+  if (rank < PHOTO_TYPES.length && Object.prototype.hasOwnProperty.call(PHOTO_TYPE_ALIASES, photoTypeKey(type))) {
+    return PHOTO_TYPES[rank];
+  }
+  return String(type || '').trim() || 'Other';
+}
+
+function sortPhotos(images) {
+  return [...(images || [])].sort((a, b) => {
+    const rank = photoTypeRank(a.type) - photoTypeRank(b.type);
+    if (rank) return rank;
+    const number = Number(a.img_number || 0) - Number(b.img_number || 0);
+    if (number) return number;
+    return Number(a.id || 0) - Number(b.id || 0);
+  });
+}
+
 function ensureImageTypes() {
-  const names = ['License', 'JOB SHEET', 'RECIEPT', 'CUSTOMER', 'SINGLE ITEM PHOTOS', 'SINGLE SCALE PHOTO'];
   const insert = db.prepare('INSERT INTO lookups (type, description, category) VALUES (?, ?, NULL)');
-  names.forEach((name) => {
+  PHOTO_TYPES.forEach((name) => {
     const found = db.prepare('SELECT id FROM lookups WHERE type = ? AND description = ?').get('imageType', name);
     if (!found) insert.run('imageType', name);
+  });
+  const keep = new Set(PHOTO_TYPES.map((name) => name.toLowerCase()));
+  const active = db.prepare('SELECT id, description FROM lookups WHERE type = ?').all('imageType');
+  active.forEach((row) => {
+    if (!keep.has(String(row.description || '').trim().toLowerCase())) {
+      db.prepare('UPDATE lookups SET deleted = 1 WHERE id = ?').run(row.id);
+    }
   });
 }
 
@@ -286,4 +366,6 @@ try {
   throw error;
 }
 
-module.exports = { db, today, addDays, ensureOpening };
+module.exports = {
+  db, today, addDays, ensureOpening, PHOTO_TYPES, photoTypeRank, photoTypeLabel, sortPhotos,
+};

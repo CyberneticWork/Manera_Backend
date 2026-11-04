@@ -8,7 +8,7 @@ const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const storage = require('./storage');
 const acl = require('./acl');
-const { db, today, addDays, ensureOpening } = require('./db');
+const { db, today, addDays, ensureOpening, photoTypeRank } = require('./db');
 const biz = require('./business');
 const { build: buildPdf, collect: collectReport } = require('./pdfs');
 
@@ -415,6 +415,9 @@ app.get('/api/lookups', auth, (_req, res) => {
     if (!grouped[row.type]) grouped[row.type] = [];
     grouped[row.type].push(row);
   }
+  if (grouped.imageType) {
+    grouped.imageType.sort((a, b) => photoTypeRank(a.description) - photoTypeRank(b.description) || a.id - b.id);
+  }
   res.json(grouped);
 });
 
@@ -471,6 +474,19 @@ app.get('/api/clients/next/code', auth, permit('clients'), (_req, res) => {
   res.json(biz.nextDocNo());
 });
 
+function assertUniqueNicDate(nic, date, exceptDocNo) {
+  const cleanNic = String(nic || '').trim();
+  const cleanDate = String(date || '').trim().slice(0, 10);
+  if (!cleanNic || !cleanDate) return;
+  const existing = db.prepare(
+    `SELECT doc_no FROM client_header
+     WHERE LOWER(TRIM(nic)) = LOWER(?) AND LEFT(\`date\`, 10) = ? AND doc_no <> ?`
+  ).get(cleanNic, cleanDate, exceptDocNo || '');
+  if (existing) {
+    bad(`NIC ${cleanNic} already has job ${existing.doc_no} on ${cleanDate}. Open that job and update it.`);
+  }
+}
+
 function saveItems(docNo, nic, date, items) {
   db.prepare('UPDATE client_items SET deleted = 1 WHERE doc_no = ? AND deleted = 0').run(docNo);
   const insert = db.prepare(
@@ -498,6 +514,7 @@ app.post('/api/clients', auth, permit('clients:create'), asyncRoute((req, res) =
   const { docNo, code } = biz.nextDocNo();
   const date = body.date || today();
   const save = db.transaction(() => {
+    assertUniqueNicDate(body.nic, date);
     db.prepare(
       `INSERT INTO client_header
         (doc_no, code, nic, name, address, mobile_no, location, agent_name, agent_commission,
@@ -529,15 +546,17 @@ app.put('/api/clients/:docNo', auth, permit('clients:update', 'cashier:update'),
   if (!riderOwns(req.user, existing)) return res.status(404).json({ error: 'Job not found' });
   const body = req.body || {};
   const date = body.date || existing.date;
+  const nic = body.nic ?? existing.nic;
   const riderName = riderChoice(req.user) || (body.riderName ?? existing.rider_name);
   const save = db.transaction(() => {
+    assertUniqueNicDate(nic, date, req.params.docNo);
     db.prepare(
       `UPDATE client_header SET nic = ?, name = ?, address = ?, mobile_no = ?, location = ?,
         agent_name = ?, agent_commission = ?, rider_name = ?, rider_commission = ?, job_type = ?,
         job_note_no = ?, date = ?, note = ?, buddy = ?, answered = ?, total_amount = ?
        WHERE doc_no = ?`
     ).run(
-      body.nic ?? existing.nic,
+      nic,
       body.name ?? existing.name,
       body.address ?? existing.address,
       body.mobileNo ?? existing.mobile_no,
@@ -555,7 +574,7 @@ app.put('/api/clients/:docNo', auth, permit('clients:update', 'cashier:update'),
       body.totalAmount !== undefined ? num(body.totalAmount) : existing.total_amount,
       req.params.docNo
     );
-    if (Array.isArray(body.items)) saveItems(req.params.docNo, body.nic ?? existing.nic, date, body.items);
+    if (Array.isArray(body.items)) saveItems(req.params.docNo, nic, date, body.items);
   });
   save();
   biz.audit(req.user.username, 'CLIENT', req.params.docNo, 'Update job');
