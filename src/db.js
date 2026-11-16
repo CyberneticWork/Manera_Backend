@@ -267,19 +267,23 @@ function seed() {
 }
 
 const PHOTO_TYPES = [
-  'ID front',
-  'ID back',
-  'License',
-  'Passport',
-  'Job sheet',
-  'Receipt',
-  'Customer',
-  'Customer vehicle',
-  'All item photo',
-  'All item scale photo',
-  'Single item photo',
-  'Single scale photo',
-  'Other',
+  { name: 'ID Front', group: 'ID' },
+  { name: 'ID Back', group: 'ID' },
+  { name: 'License', group: '' },
+  { name: 'Passport', group: '' },
+  { name: 'Job sheet', group: '' },
+  { name: 'Bill', group: '' },
+  { name: 'Reciept', group: '' },
+  { name: 'Customer', group: 'Customer' },
+  { name: 'Customer Vehicle', group: 'Customer' },
+  { name: 'Other customer', group: 'Customer' },
+  { name: 'C All item scale photo', group: 'C' },
+  { name: 'C All item photo', group: 'C' },
+  { name: 'C Single item scale photo', group: 'C' },
+  { name: 'C Single item photo', group: 'C' },
+  { name: 'All item photo', group: 'All' },
+  { name: 'All item scale photo', group: 'All' },
+  { name: 'Single item scale photo', group: 'All' },
 ];
 
 const PHOTO_TYPE_ALIASES = {
@@ -293,23 +297,26 @@ const PHOTO_TYPE_ALIASES = {
   passport: 3,
   'job sheet': 4,
   jobsheet: 4,
-  receipt: 5,
-  reciept: 5,
-  customer: 6,
-  'customer vehicle': 7,
-  customervehicle: 7,
-  'all item photo': 8,
-  'all item photos': 8,
-  'all item scale photo': 9,
-  'all item scale photos': 9,
-  'single item photo': 10,
-  'single item photos': 10,
-  'single scale photo': 11,
-  'single scale photos': 11,
-  other: 12,
-  item: 12,
-  'not assing': 12,
-  'not assign': 12,
+  bill: 5,
+  reciept: 6,
+  receipt: 6,
+  customer: 7,
+  'customer vehicle': 8,
+  customervehicle: 8,
+  'other customer': 9,
+  'c all item scale photo': 10,
+  'c all item photo': 11,
+  'c single item scale photo': 12,
+  'single scale photo': 12,
+  'single scale photos': 12,
+  'c single item photo': 13,
+  'single item photo': 13,
+  'single item photos': 13,
+  'all item photo': 14,
+  'all item photos': 14,
+  'all item scale photo': 15,
+  'all item scale photos': 15,
+  'single item scale photo': 16,
 };
 
 function photoTypeKey(type) {
@@ -325,7 +332,7 @@ function photoTypeRank(type) {
 function photoTypeLabel(type) {
   const rank = photoTypeRank(type);
   if (rank < PHOTO_TYPES.length && Object.prototype.hasOwnProperty.call(PHOTO_TYPE_ALIASES, photoTypeKey(type))) {
-    return PHOTO_TYPES[rank];
+    return PHOTO_TYPES[rank].name;
   }
   return String(type || '').trim() || 'Other';
 }
@@ -341,12 +348,15 @@ function sortPhotos(images) {
 }
 
 function ensureImageTypes() {
-  const insert = db.prepare('INSERT INTO lookups (type, description, category) VALUES (?, ?, NULL)');
-  PHOTO_TYPES.forEach((name) => {
-    const found = db.prepare('SELECT id FROM lookups WHERE type = ? AND description = ?').get('imageType', name);
-    if (!found) insert.run('imageType', name);
+  const insert = db.prepare('INSERT INTO lookups (type, description, category) VALUES (?, ?, ?)');
+  const setCategory = db.prepare('UPDATE lookups SET category = ? WHERE id = ?');
+  PHOTO_TYPES.forEach((row) => {
+    const category = row.group || null;
+    const found = db.prepare('SELECT id, category FROM lookups WHERE type = ? AND description = ?').get('imageType', row.name);
+    if (!found) insert.run('imageType', row.name, category);
+    else if ((found.category || null) !== category) setCategory.run(category, found.id);
   });
-  const keep = new Set(PHOTO_TYPES.map((name) => name.toLowerCase()));
+  const keep = new Set(PHOTO_TYPES.map((row) => row.name.toLowerCase()));
   const active = db.prepare('SELECT id, description FROM lookups WHERE type = ?').all('imageType');
   active.forEach((row) => {
     if (!keep.has(String(row.description || '').trim().toLowerCase())) {
